@@ -4,5 +4,5 @@ Repo focussing on personal gains in the field of language modelling.
 Torch based, will add further implementations if I have time. 
 
 ### List of archs
-- [ x ] gpt2
-- [ x ] llama2
+- [x] gpt2
+- [x] llama2
