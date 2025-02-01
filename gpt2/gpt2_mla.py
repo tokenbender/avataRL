@@ -68,10 +68,11 @@ class Config:
     d_model: int = 768
     n_heads: int = 12
 
-# ---------------------------------------------------------
-# MLA: Ropeless implementation with KVCache 
-# ---------------------------------------------------------
+
 class MLA(nn.Module):
+    '''
+        Ropeless implementation of MLA with KVCache
+    '''
     def __init__(self, config):
         super().__init__()
         self.d_model = config.d_model  # e.g. 384
@@ -256,9 +257,7 @@ class GPT(nn.Module):
 
         return logits, loss, new_KV_caches
 
-# ---------------------------------------------------------
-# Training Loop
-# ---------------------------------------------------------
+
 if __name__ == "__main__":
     # Create a GPT config for MLA
     gpt_config = Config(
