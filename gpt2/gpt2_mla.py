@@ -61,9 +61,6 @@ class Config:
     block_size: int = 1024    # max sequence length
     vocab_size: int = 50257   # GPT-2 BPE vocab size
     n_layer: int = 12
-    n_head: int = 12
-    n_embed: int = 768
-
     # Additional fields for MLA usage
     d_model: int = 768
     n_heads: int = 12
