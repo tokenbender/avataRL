@@ -261,8 +261,8 @@ if __name__ == "__main__":
         block_size=block_size,
         vocab_size=50257,
         n_layer=n_layer,
-        n_head=n_head,
-        n_embed=n_embed,
+        n_head=n_heads,
+        n_embed=d_model,
         d_model=n_embed,   # for MLA, matches n_embed
         n_heads=n_head
     )
