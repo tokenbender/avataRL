@@ -5,6 +5,9 @@ Torch based, will add further implementations if I have time.
 ### Tokenizers
 
 - [X] gpt2-bpe
+
+### To do 
+> add finetuning
 ### List of archs
 - [x] gpt2
 - [x] llama2
