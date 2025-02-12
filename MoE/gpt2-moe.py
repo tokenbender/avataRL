@@ -17,19 +17,10 @@ from tabulate import tabulate  # For printing a nice table
 import concurrent.futures  # For asynchronous prefetching
 
 
-torch.set_float32_matmul_precision('high')
-# Attempt to import FlashAttention.
-try:
-    from flash_attn.flash_attn_interface import flash_attn
-    print("[Info] FlashAttention imported successfully.")
-except ImportError:
-    flash_attn = None
-    print("[Info] FlashAttention not found; using default scaled dot-product attention.")
-
 # -----------------------------------------------------------------------------
 # Updated Hyperparameters and settings to process more tokens per batch
-batch_size = 16   
-block_size = 1024     # Increased sequence length
+batch_size = 32     # (Adjust based on your GPU memory)
+block_size = 512      # Increased sequence length
 max_iters = 100
 eval_interval = 100
 learning_rate = 3e-4
@@ -124,8 +115,8 @@ class CausalSelfAttention(nn.Module):
         query = query.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
         key   = key.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
         value = value.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
-        
-        attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=True) #flash_Attn here 
+
+        attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=True)
         attn_output = attn_output.transpose(1,2).contiguous().view(B, T, C)
         return self.c_proj(attn_output)
 
@@ -187,7 +178,7 @@ class SparseMoE(nn.Module):
                 weighted_output = expert_output * gating_scores
                 updates.index_add_(0, limited_indices, weighted_output)
         final_output += updates.view(B, T, C)
-        return final_output
+        return final_output, indices
 
 class Block(nn.Module):
     def __init__(self, config):
@@ -198,7 +189,12 @@ class Block(nn.Module):
         self.moe = SparseMoE(config)
     def forward(self, x):
         x = x + self.attention(self.layer_norm_1(x))
-        x = x + self.moe(self.layer_norm_2(x))
+        moe_output, moe_indices = self.moe(self.layer_norm_2(x))
+        x = x + moe_output
+        # Aggregate expert usage counts globally.
+        counts = torch.bincount(moe_indices.flatten(), minlength=num_experts).cpu().numpy().tolist()
+        for i, count in enumerate(counts):
+            global_expert_usage[i] += count
         return x
 
 class GPT(nn.Module):
@@ -249,6 +245,9 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
+
+# Global dictionary to accumulate expert usage counts.
+global_expert_usage = {i: 0 for i in range(num_experts)}
 
 # -----------------------------------------------------------------------------
 # Compute total tokens available in the selected shards and print table
@@ -324,7 +323,7 @@ if __name__ == "__main__":
                     x, y = x.to(device), y.to(device)
                 
                 optimizer.zero_grad()
-                with torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=(device_type=="cuda")):
+                with torch.amp.autocast(device_type=device_type, dtype=torch.float16, enabled=(device_type=="cuda")):
                     logits, loss = model(x, y)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -334,15 +333,18 @@ if __name__ == "__main__":
                 
                 if i % 10 == 0:
                     tokens_processed = batch_size * block_size
-                    # Update MFU estimation using the L4's FP16 peak of 121 TFLOPs.
+                    # Updated MFU estimation using L4's FP16 peak of 121 TFLOPs.
                     mfu = (6 * total_params * tokens_processed) / (121e12 * iter_time) * 100
+                    tokens_per_sec = tokens_processed / iter_time
                     msg = (f"[Training] Step {i}: Loss = {loss.item():.4f}, Iteration Time = {iter_time*1000:.2f} ms, "
-                           f"Tokens Processed = {tokens_processed}, Estimated MFU = {mfu:.2f}%")
+                           f"Tokens Processed = {tokens_processed}, Throughput = {tokens_per_sec:.2f} tokens/s, "
+                           f"Estimated MFU = {mfu:.2f}%")
                     print(msg)
                     mlflow.log_metric("train_loss", loss.item(), step=i)
                     mlflow.log_metric("iteration_time_ms", iter_time * 1000, step=i)
                     mlflow.log_metric("mfu", mfu, step=i)
                     mlflow.log_metric("tokens_processed", tokens_processed, step=i)
+                    mlflow.log_metric("tokens_per_second", tokens_per_sec, step=i)
                 
                 if i % 100 == 0:
                     gen_context = torch.zeros((1, 1), dtype=torch.long, device=device)
@@ -355,6 +357,12 @@ if __name__ == "__main__":
         print(f"[Training] Training complete in {total_time:.2f} seconds")
         mlflow.log_metric("total_training_time_s", total_time)
         mlflow.log_metric("total_run_time_s", total_time)
+        
+        # Log the accumulated expert usage distribution.
+        print("[Expert Usage] Distribution of expert selections:")
+        for expert_id, count in global_expert_usage.items():
+            print(f"  Expert {expert_id}: {count}")
+        mlflow.log_param("expert_usage", str(global_expert_usage))
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         checkpoint_dir = "checkpoints"
