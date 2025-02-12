@@ -28,7 +28,7 @@ except ImportError:
 
 # -----------------------------------------------------------------------------
 # Updated Hyperparameters and settings to process more tokens per batch
-batch_size = 16   # (Adjust based on your GPU memory)
+batch_size = 16   
 block_size = 1024     # Increased sequence length
 max_iters = 100
 eval_interval = 100
@@ -124,10 +124,8 @@ class CausalSelfAttention(nn.Module):
         query = query.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
         key   = key.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
         value = value.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
-        if flash_attn is not None:
-            attn_output = flash_attn(query, key, value, dropout_p=0.0, causal=True)
-        else:
-            attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=True)
+        
+        attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=True) #flash_Attn here 
         attn_output = attn_output.transpose(1,2).contiguous().view(B, T, C)
         return self.c_proj(attn_output)
 
