@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 import os
 import sys
 import glob
@@ -12,12 +13,24 @@ import tiktoken
 from dataclasses import dataclass
 import numpy as np
 from tqdm import tqdm  # For progress bar
+from tabulate import tabulate  # For printing a nice table
+import concurrent.futures  # For asynchronous prefetching
+
+
+torch.set_float32_matmul_precision('high')
+# Attempt to import FlashAttention.
+try:
+    from flash_attn.flash_attn_interface import flash_attn
+    print("[Info] FlashAttention imported successfully.")
+except ImportError:
+    flash_attn = None
+    print("[Info] FlashAttention not found; using default scaled dot-product attention.")
 
 # -----------------------------------------------------------------------------
 # Updated Hyperparameters and settings to process more tokens per batch
-batch_size = 64      # Increased batch size
-block_size = 256    # Increased sequence length
-max_iters = 1000
+batch_size = 16   # (Adjust based on your GPU memory)
+block_size = 1024     # Increased sequence length
+max_iters = 100
 eval_interval = 100
 learning_rate = 3e-4
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -38,7 +51,6 @@ class ShardedDataLoader:
         Loads tokens from the first 5 bin files found in data_dir matching the pattern.
         The bin files are assumed to be stored as uint16.
         """
-        # Find matching files, take the first 5, and shuffle their order.
         self.files = sorted(glob.glob(os.path.join(data_dir, pattern)))[:5]
         if not self.files:
             raise ValueError(f"No files found with pattern {pattern} in {data_dir}")
@@ -56,10 +68,8 @@ class ShardedDataLoader:
         print(f"[DataLoader] Shard length: {self.shard_length} tokens")
     
     def next_batch(self):
-        # We need B*T+1 tokens to form a full batch (for inputs and shifted targets).
         required_tokens = self.B * self.T + 1
         if self.pos + required_tokens > self.shard_length:
-            # Switch to the next shard (cycling if needed)
             self.current_shard_index = (self.current_shard_index + 1) % len(self.files)
             self.load_shard(self.files[self.current_shard_index])
         batch_tokens = self.data[self.pos:self.pos + required_tokens]
@@ -67,14 +77,13 @@ class ShardedDataLoader:
         x = batch_tokens[:-1].view(self.B, self.T)
         y = batch_tokens[1:].view(self.B, self.T)
         self.pos += self.B * self.T
-        
-        # Clamp tokens to the valid range for our vocabulary (0 to 50303)
+
         VOCAB_SIZE = 50304
         x = torch.clamp(x, min=0, max=VOCAB_SIZE - 1)
         y = torch.clamp(y, min=0, max=VOCAB_SIZE - 1)
-        
-        # Logging the token range for debugging
-        print(f"[DataLoader] Batch token range: min={x.min().item()}, max={x.max().item()}")
+        if device == "cuda":
+            x = x.pin_memory()
+            y = y.pin_memory()
         return x, y
 
 # -----------------------------------------------------------------------------
@@ -88,7 +97,7 @@ def decode(tokens):
 @dataclass
 class config:
     block_size: int = 1024
-    vocab_size: int = 50304  # Updated vocab size
+    vocab_size: int = 50304
     n_layer: int = n_layer
     n_head: int = n_head
     n_embed: int = n_embed
@@ -96,6 +105,7 @@ class config:
     top_k: int = top_k
     capacity_factor: float = capacity_factor
 
+# Use FlashAttention if available.
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -107,18 +117,19 @@ class CausalSelfAttention(nn.Module):
         self.c_proj.NANOGPT_SCALE_INIT = 1
         self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size))
                              .view(1, 1, config.block_size, config.block_size))
-
     def forward(self, x):
         B, T, C = x.size()
         qkv = self.c_attention(x)
         query, key, value = qkv.split(self.n_embed, dim=2)
-        key = key.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        query = query.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        value = value.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        y = F.scaled_dot_product_attention(query, key, value, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
-        return y
+        query = query.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
+        key   = key.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
+        value = value.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
+        if flash_attn is not None:
+            attn_output = flash_attn(query, key, value, dropout_p=0.0, causal=True)
+        else:
+            attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=True)
+        attn_output = attn_output.transpose(1,2).contiguous().view(B, T, C)
+        return self.c_proj(attn_output)
 
 class Expert(nn.Module):
     def __init__(self, config):
@@ -203,8 +214,7 @@ class GPT(nn.Module):
             layernorm_f = nn.LayerNorm(config.n_embed),
         ))
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
-        # Weight tying: share the embedding matrix with the final projection.
-        self.transformer.wte.weight = self.lm_head.weight
+        self.transformer.wte.weight = self.lm_head.weight  # Weight tying
         self.apply(self.__init__weights)
     def __init__weights(self, module):
         if isinstance(module, nn.Linear):
@@ -243,24 +253,47 @@ class GPT(nn.Module):
         return idx
 
 # -----------------------------------------------------------------------------
+# Compute total tokens available in the selected shards and print table
+def print_data_stats(files, B, T):
+    total_tokens = 0
+    for f in files:
+        data = np.memmap(f, dtype=np.uint16, mode='r')
+        total_tokens += len(data)
+    tokens_per_batch = B * T
+    table_data = [
+        ["Total Tokens in Shards", total_tokens],
+        ["Batch Size", B],
+        ["Block Size", T],
+        ["Tokens per Batch", tokens_per_batch]
+    ]
+    print("\n" + tabulate(table_data, headers=["Metric", "Value"], tablefmt="fancy_grid") + "\n")
+
+# -----------------------------------------------------------------------------
 # Main Training Loop
 if __name__ == "__main__":
-    # Set up the data loader to use the first 5 shards from our data directory.
-    data_dir = "finewebedu10B"  # Adjust this to your data directory.
+    data_dir = "finewebedu10B"  # Adjust to your data directory.
     train_pattern = "finewebedu_train_*.bin"  # Pattern for training bin files.
     train_loader = ShardedDataLoader(data_dir, train_pattern, batch_size, block_size)
     
-    # Initialize the model and move it to the appropriate device.
+    # Print data statistics in a nice table.
+    print_data_stats(train_loader.files, batch_size, block_size)
+    
     model = GPT(config())
     model.to(device)
-    model = torch.compile(model)  # PyTorch 2.0 compile for speed.
     
-    # Compute and log the number of parameters.
+    # Determine device type for autocast.
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Enable mixed precision training using torch.amp.autocast.
+    scaler = torch.cuda.amp.GradScaler()
+    
+    # Compile model with torch.compile for kernel fusion and optimization.
+    model = torch.compile(model)
+    
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[Model] Total parameters: {total_params}, Trainable parameters: {trainable_params}")
     
-    # Set up mlflow logging and log parameter counts.
     mlflow.set_experiment("GPT_MoE_Training")
     with mlflow.start_run():
         mlflow.log_param("batch_size", batch_size)
@@ -276,54 +309,55 @@ if __name__ == "__main__":
         
         print("[Training] Starting training loop...")
         start_time = time.time()
-        
-        # Define the optimizer once outside the loop.
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
         
-        for i in tqdm(range(max_iters), desc="Training"):
-            iter_start = time.time()
-            x, y = train_loader.next_batch()
-            # Log token range for debugging.
-            print(f"[Training] Input token range: min={x.min().item()}, max={x.max().item()}")
-            x, y = x.to(device), y.to(device)
-            
-            optimizer.zero_grad()
-            logits, loss = model(x, y)
-            loss.backward()
-            optimizer.step()
-            
-            iter_time = time.time() - iter_start
-            
-            # Every 10 steps, print and log extra info.
-            if i % 10 == 0:
-                tokens_processed = batch_size * block_size
-                # Rough estimate of MFU (Model Floating-point Utilization)
-                # This is a rough estimate using: mfu = (6 * total_params * tokens_processed) / (peak_flops * iter_time) * 100.
-                # Assuming a peak of 250e12 FLOPs (250 TFLOPS) for your GPU.
-                mfu = (6 * total_params * tokens_processed) / (250e12 * iter_time) * 100
-                msg = (f"[Training] Step {i}: Loss = {loss.item():.4f}, Iteration Time = {iter_time*1000:.2f} ms, "
-                       f"Tokens Processed = {tokens_processed}, Estimated MFU = {mfu:.2f}%")
-                print(msg)
-                mlflow.log_metric("train_loss", loss.item(), step=i)
-                mlflow.log_metric("iteration_time_ms", iter_time * 1000, step=i)
-                mlflow.log_metric("mfu", mfu, step=i)
-                mlflow.log_metric("tokens_processed", tokens_processed, step=i)
-            
-            # Every 100 steps, generate a short sample.
-            if i % 100 == 0:
-                gen_context = torch.zeros((1, 1), dtype=torch.long, device=device)
-                generated = model.generate(gen_context, max_new_tokens=50)
-                gen_text = decode(generated[0].tolist())
-                print(f"[Generation] Step {i}: {gen_text}")
-                mlflow.log_param(f"gen_text_{i}", gen_text)
+        # Setup prefetching with a single background thread.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            prefetch_future = executor.submit(train_loader.next_batch)
+            for i in tqdm(range(max_iters), desc="Training"):
+                iter_start = time.time()
+                x, y = prefetch_future.result()
+                prefetch_future = executor.submit(train_loader.next_batch)
+                
+                if device == "cuda":
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                else:
+                    x, y = x.to(device), y.to(device)
+                
+                optimizer.zero_grad()
+                with torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=(device_type=="cuda")):
+                    logits, loss = model(x, y)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                
+                iter_time = time.time() - iter_start
+                
+                if i % 10 == 0:
+                    tokens_processed = batch_size * block_size
+                    # Update MFU estimation using the L4's FP16 peak of 121 TFLOPs.
+                    mfu = (6 * total_params * tokens_processed) / (121e12 * iter_time) * 100
+                    msg = (f"[Training] Step {i}: Loss = {loss.item():.4f}, Iteration Time = {iter_time*1000:.2f} ms, "
+                           f"Tokens Processed = {tokens_processed}, Estimated MFU = {mfu:.2f}%")
+                    print(msg)
+                    mlflow.log_metric("train_loss", loss.item(), step=i)
+                    mlflow.log_metric("iteration_time_ms", iter_time * 1000, step=i)
+                    mlflow.log_metric("mfu", mfu, step=i)
+                    mlflow.log_metric("tokens_processed", tokens_processed, step=i)
+                
+                if i % 100 == 0:
+                    gen_context = torch.zeros((1, 1), dtype=torch.long, device=device)
+                    generated = model.generate(gen_context, max_new_tokens=50)
+                    gen_text = decode(generated[0].tolist())
+                    print(f"[Generation] Step {i}: {gen_text}")
+                    mlflow.log_param(f"gen_text_{i}", gen_text)
         
         total_time = time.time() - start_time
         print(f"[Training] Training complete in {total_time:.2f} seconds")
         mlflow.log_metric("total_training_time_s", total_time)
-        mlflow.log_metric("total_run_time_s", total_time)  # Log the overall run time.
+        mlflow.log_metric("total_run_time_s", total_time)
         
-        # -----------------------------------------------------------------------------
-        # Save the model state with a timestamped filename.
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         checkpoint_dir = "checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -332,8 +366,6 @@ if __name__ == "__main__":
         print(f"[Checkpoint] Model saved at {model_save_path}")
         mlflow.log_artifact(model_save_path)
     
-    # -----------------------------------------------------------------------------
-    # Final Generation after training
     print("[Generation] Generating final text sample...")
     context = torch.zeros((1, 1), dtype=torch.long, device=device)
     output = model.generate(context, max_new_tokens=500)
@@ -341,6 +373,5 @@ if __name__ == "__main__":
     print("[Generation] Generated Text:")
     print(generated_text)
     
-    # Save the generated text to a file.
     with open("output.txt", "w", encoding='utf-8') as f:
         f.write(generated_text)
