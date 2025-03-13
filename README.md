@@ -11,3 +11,4 @@ Torch based, will add further implementations if I have time.
 ### List of archs
 - [x] gpt2
 - [x] llama2
+- [x] SigLip(training code to be added)
