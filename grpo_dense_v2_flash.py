@@ -5,33 +5,32 @@ Simplified implementation focusing on:
 - GRPO V2 training dynamics
 - Flash Attention for efficient computation
 - Mixed precision training
-- Clean, maintainable code
 """
 
-# ─── hyper-params (GRPO Exhaustive V2 style - optimized for H100) ────────
-CONTEXT_LEN = 100                 # Sliding window context (like v2)
-HORIZON = 70                      # Characters to generate (like v2)
+# ─── hyper-params ────────────────────────────────────────────────────────
+CONTEXT_LEN = 32                  # Sliding window context
+HORIZON = 8                       # Characters to generate
 BATCH = 512                       # Large batch via accumulation
 MICRO_BATCH = 64                  # Moderate micro-batch 
 GRAD_ACCUM = BATCH // MICRO_BATCH # 8 gradient accumulation steps
-TOTAL_ITERS = 500                 # Same as v2
-LR = 3e-5                         # Same as v2
-BETA_KL = 1e-3                    # Reduced KL penalty (like v2)
-KL_WARM = 50_000                  # Faster warmup (like v2)
-NEG_REWARD = False                # No negative rewards (like v2)
+TOTAL_ITERS = 500                 # Training iterations
+LR = 3e-5                         # Learning rate
+BETA_KL = 1e-3                    # KL divergence coefficient
+KL_WARM = 50_000                  # KL warmup tokens
+NEG_REWARD = False                # No negative rewards
 GPU_TYPE = "H100"                 
-CLIP_RATIO = 0.5                  # Increased for exploration (like v2)
-K_SAMPLES = 4                     # Fixed K for all generations (like v2)
-ENTROPY_COEF = 0.01               # Entropy bonus (like v2)
-TEMPERATURE = 1.2                 # Sampling temperature (like v2)
-MIN_VARIANCE = 0.1                # Minimum advantage variance (like v2)                
+CLIP_RATIO = 0.5                  # PPO clip ratio
+K_SAMPLES = 4                     # Samples per context
+ENTROPY_COEF = 0.01               # Entropy bonus coefficient
+TEMPERATURE = 1.2                 # Sampling temperature
+MIN_VARIANCE = 0.1                # Minimum advantage variance                
 
-# Model architecture (optimized for H100)
+# Model architecture
 N_LAYER = 6                       
 N_HEAD = 8                        
 N_EMB = 512                       # Wider for better GPU util
 
-# Simplified optimizations - keeping Flash Attention
+# Optimization settings
 USE_FLASH_ATTN = True             # Keep Flash Attention
 USE_TORCH_COMPILE = False         # Disable torch.compile to avoid conflicts
 USE_CHUNKED_LOSS = False          # Use standard loss computation
@@ -63,11 +62,10 @@ import math
 from typing import Dict, List, Tuple, Optional
 from torch.cuda.amp import autocast, GradScaler
 from functools import partial
-# Removed torch._dynamo since we're not using torch.compile
 
-stub = modal.App("grpo-dense-v2-flash")
+stub = modal.App("grpo-dense-v2-reference-logging")
 
-# TorchTune-inspired image with optimizations
+# Modal image with Flash Attention
 flash_attn_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 
 image = (
@@ -79,41 +77,38 @@ image = (
 DATA_URL = ("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/"
             "tinyshakespeare/input.txt")
 
-# Removed chunked loss and fused optimizer for simplicity
-
-# ─── Simple Data Loader (from v2 style) ─────────────────────────────────
+# ─── Data Loader ─────────────────────────────────────────────────────────
 class ContextualTextLoader:
-    """Simple data loader with sliding windows"""
+    """Provides longer context windows for better prediction"""
     def __init__(self, text, enc, B, T, context_len, device='cuda'):
         self.data = enc(text)
         self.B, self.T, self.context_len = B, T, context_len
         self.device = device
-        self.pos = 0
+        self.pos = context_len  # Start after we have enough context
         
     def next(self):
-        # Reset position if we don't have enough data left
-        if self.pos + self.context_len + self.T > len(self.data):
-            self.pos = 0
+        # Ensure we have enough context
+        if self.pos + self.B*self.T + 1 > len(self.data):
+            self.pos = self.context_len
             
-        batch_ctx = []
-        batch_tgt = []
+        contexts = []
+        targets = []
         
         for b in range(self.B):
-            # Calculate start position for this sample
-            start_idx = self.pos + b * (self.context_len + self.T)
+            # Get context window using sliding approach
+            ctx_start = self.pos - self.context_len + b*self.T
+            ctx_end = self.pos + b*self.T
             
-            # Wrap around if needed
-            if start_idx + self.context_len + self.T > len(self.data):
-                start_idx = b * (self.context_len + self.T) % (len(self.data) - self.context_len - self.T)
+            context = self.data[ctx_start:ctx_end]
+            target = self.data[ctx_end:ctx_end + self.T]
             
-            # Get context and target
-            batch_ctx.append(self.data[start_idx:start_idx + self.context_len])
-            batch_tgt.append(self.data[start_idx + self.context_len:start_idx + self.context_len + self.T])
+            contexts.append(context)
+            targets.append(target)
         
-        self.pos += self.B * (self.context_len + self.T)
+        self.pos += self.B * self.T
         
-        return (torch.stack(batch_ctx).to(self.device), 
-                torch.stack(batch_tgt).to(self.device))
+        return (torch.stack(contexts).to(self.device), 
+                torch.stack(targets).to(self.device))
 
 # ─── Optimized Attention Block ───────────────────────────────────────────
 class OptimizedAttention(nn.Module):
@@ -180,13 +175,19 @@ class OptimizedAttention(nn.Module):
         
         return self.o_proj(attn_out)
 
-# ─── TorchTune-Optimized Transformer Block ───────────────────────────────
+# ─── Helper function for RMSNorm ─────────────────────────────────────────
+def norm(x):
+    """RMSNorm implementation - compatible with PyTorch 2.3"""
+    # RMS normalization: x / sqrt(mean(x^2) + eps)
+    eps = 1e-5
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    return x * torch.rsqrt(var + eps)
+
+# ─── Transformer Block ──────────────────────────────────────────────────
 class TransformerBlock(nn.Module):
     def __init__(self, n_emb, n_head, dropout=0.1):
         super().__init__()
-        self.ln1 = nn.LayerNorm(n_emb, eps=1e-5)
         self.attn = OptimizedAttention(n_emb, n_head, dropout)
-        self.ln2 = nn.LayerNorm(n_emb, eps=1e-5)
         
         # Fused FFN operations
         self.ffn = nn.Sequential(
@@ -197,12 +198,12 @@ class TransformerBlock(nn.Module):
         )
         
     def forward(self, x, mask=None):
-        # Pre-norm architecture (more stable for compile)
-        x = x + self.attn(self.ln1(x), mask)
-        x = x + self.ffn(self.ln2(x))
+        # Pre-norm architecture with RMSNorm
+        x = x + self.attn(norm(x), mask)
+        x = x + self.ffn(norm(x))
         return x
 
-# ─── TorchTune-Optimized GPT ─────────────────────────────────────────────
+# ─── GPT Model ──────────────────────────────────────────────────────────
 class GPT(nn.Module):
     def __init__(self, V, n_layer=N_LAYER, n_head=N_HEAD, n_emb=N_EMB, 
                  context_len=CONTEXT_LEN):
@@ -221,7 +222,6 @@ class GPT(nn.Module):
             for _ in range(n_layer)
         ])
         
-        self.ln_f = nn.LayerNorm(n_emb, eps=1e-5)
         self.head = nn.Linear(n_emb, V, bias=False)
         self.head.weight = self.wte.weight  # Weight tying
         
@@ -257,14 +257,12 @@ class GPT(nn.Module):
         for layer in self.layers:
             x = layer(x, mask)
         
-        x = self.ln_f(x)
+        x = norm(x)  # RMSNorm instead of LayerNorm
         logits = self.head(x)
         
         return logits
 
-# Removed CUDA Graph Generator - using simple temperature-based generation instead
-
-# ─── Standard functions (adapted from GRPO v2) ──────────────────────────
+# ─── Helper functions ─────────────────────────────────────────────────────
 def ensure_dataset(p="input.txt"):
     if not Path(p).exists():
         Path(p).write_text(requests.get(DATA_URL, timeout=10).text, encoding="utf-8")
@@ -354,7 +352,7 @@ def compute_rewards(gen, ref, ref_logits):
         # Log probability as partial reward
         partial_reward = torch.log(gen_probs + 1e-10) / 10.0  # Scale down
     
-    # Combined reward (v2 style)
+    # Combined reward
     reward = exact_match + 0.1 * partial_reward
     
     return reward
@@ -463,7 +461,7 @@ def train_remote():
     
     # Initialize wandb
     run = wandb.init(
-        project="gpt2-grpo-v2-torchtune",
+        project="gpt2-grpo-v2",
         config={
             "model": {
                 "vocab_size": V,
@@ -503,12 +501,14 @@ def train_remote():
         
         total_loss = 0.0
         all_metrics = defaultdict(list)
+        all_R = []  # Store rewards for logging
+        all_adv = []  # Store advantages for logging
         
         for accum_step in range(GRAD_ACCUM):
             # Load data
             ctx, ref_tok = loader.next()
             
-            # Generate samples with temperature-based sampling (v2 style)
+            # Generate samples with temperature-based sampling
             with torch.no_grad():
                 G = generate_with_temperature(actor_old, ctx, HORIZON, K_SAMPLES, temperature=TEMPERATURE)
             
@@ -533,6 +533,10 @@ def train_remote():
             adv = R - base
             adv_std = torch.maximum(adv.std(dim=1, keepdim=True), torch.tensor(MIN_VARIANCE, device=DEV))
             adv = adv / adv_std
+            
+            # Store for logging
+            all_R.append(R)
+            all_adv.append(adv)
             
             # Flatten
             flat_G = G.reshape(-1, HORIZON)
@@ -600,42 +604,35 @@ def train_remote():
         
         chars_seen += BATCH * HORIZON
         
-        # Update old policy more frequently (v2 style)
+        # Update old policy every 5 iterations
         if it % 5 == 0:
             actor_old.load_state_dict(actor.state_dict())
             actor_old.eval()
         
-        # Logging
+        # Logging (reference style + accuracy)
         if it % LOG_INTERVAL == 0:
-            avg_metrics = {k: np.mean(v) for k, v in all_metrics.items()}
-            
-            gpu_mem_used = torch.cuda.memory_allocated() / 1e9
-            gpu_mem_reserved = torch.cuda.memory_reserved() / 1e9
-            
-            # Calculate tokens/sec
-            tokens_per_iter = BATCH * HORIZON
-            time_per_iter = 1.0  # Approximate, would need actual timing
-            tokens_per_sec = tokens_per_iter / time_per_iter
+            # Aggregate rewards and advantages from all accumulation steps
+            R_all = torch.cat(all_R, dim=0) if all_R else R
+            adv_all = torch.cat(all_adv, dim=0) if all_adv else adv
             
             wandb.log({
-                "performance/accuracy": avg_metrics.get("accuracy", 0),
-                "performance/reward_mean": avg_metrics.get("reward_mean", 0),
-                "performance/tokens_per_sec": tokens_per_sec,
-                "rl/policy_loss": avg_metrics.get("pol_loss", 0),
-                "rl/kl_divergence": avg_metrics.get("kl", 0),
-                "rl/kl_coefficient": current_kl_coef,
-                "rl/entropy": avg_metrics.get("entropy", 0),
-                "rl/ratio": avg_metrics.get("ratio", 1.0),
-                "rl/ratio_max": avg_metrics.get("ratio_max", 1.0),
-                "training/total_loss": total_loss * GRAD_ACCUM,
-                "training/learning_rate": opt.param_groups[0]['lr'],
-                "hardware/gpu_memory_used_gb": gpu_mem_used,
-                "hardware/gpu_memory_reserved_gb": gpu_mem_reserved,
-                "iteration": it,
-                "chars_seen": chars_seen,
-            }, step=it)
+                "reward": R_all.mean().item(),
+                "reward_max": R_all.max().item(),
+                "reward_min": R_all.min().item(),
+                "advantage_mean": adv_all.mean().item(),
+                "advantage_std": adv_all.std().item(),
+                "kl": all_metrics.get("kl", [0])[-1] if all_metrics.get("kl") else 0,
+                "kl_coef": current_kl_coef,
+                "ratio": all_metrics.get("ratio", [1.0])[-1] if all_metrics.get("ratio") else 1.0,
+                "ratio_max": all_metrics.get("ratio_max", [1.0])[-1] if all_metrics.get("ratio_max") else 1.0,
+                "entropy": all_metrics.get("entropy", [0])[-1] if all_metrics.get("entropy") else 0,
+                "pol_loss": all_metrics.get("pol_loss", [0])[-1] if all_metrics.get("pol_loss") else 0,
+                "total_loss": total_loss * GRAD_ACCUM,
+                "accuracy": np.mean(all_metrics.get("accuracy", [0])),  # Our addition
+                "chars": chars_seen,
+            }, step=chars_seen)
         
-        # Generate samples periodically (v2 style)
+        # Generate samples periodically
         if it % SAMPLE_INTERVAL == 0:
             with torch.no_grad():
                 # Generate at different temperatures
@@ -657,7 +654,7 @@ def train_remote():
                     "samples": wandb.Html(
                         "<pre>" + "\n\n".join(samples) + "</pre>"
                     )
-                }, step=it)
+                }, step=chars_seen)
         
         # Evaluation
         if it % EVAL_INTERVAL == 0:
@@ -679,7 +676,7 @@ def train_remote():
                 wandb.log({
                     "eval/perplexity": perplexity.item(),
                     "eval/loss": val_loss.item(),
-                }, step=it)
+                }, step=chars_seen)
     
     # Final summary
     wandb.summary.update({
