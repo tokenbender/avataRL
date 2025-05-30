@@ -7,13 +7,15 @@ training a tinyshakespeare model -> zero pretrain, all rl baby.
 normal process for building models for any task is typically pretrain + midtrain + sft + rl, where my understanding is that
 
 - pretrain = builds a world model
-- midtrain = adds extensive domain knowledge for amny area absent in organic pretrain corpus
+- midtrain = adds extensive domain knowledge for any area absent in organic pretrain corpus
 - sft = rich demonstration data on instruction following, alignment, establishing persona and style
 - rl = optimize the demonstrable to what can get fuzzy. improve reasoning, honesty and harmlessness. teaching the model to read between the lines.
 
 this repository contains an optimized implementation of gpt2 but getting trained purely with grpo (group relative policy optimization). 
+
 so you can see we are skipping all stages directly. but for the objective we have, i.e. tinyshakespeare level, we are skipping just one stage - pretraining.
 the implementation is hyperoptimized, as all good things should be.
+
 and we might be creating lots of unorthodox things here, as any fun loving man should.
 
 ## key features
