@@ -1,10 +1,8 @@
 #!/usr/bin/env python
 """
-GRPO Dense GPT - V2 Style with Flash Attention
-Simplified implementation focusing on:
-- GRPO V2 training dynamics
-- Flash Attention for efficient computation
-- Mixed precision training
+GRPO Dense GPT – V2 with Flash‑Attention with  RoPE & QK‑Norm
+===========================================================
+
 """
 
 # ─── hyper-params ────────────────────────────────────────────────────────
@@ -49,218 +47,212 @@ SAMPLE_INTERVAL = 20
 # Mixed precision
 USE_AMP = True                    
 AMP_DTYPE = "bfloat16"           
-# USE_FLASH_ATTN is set by the auto-configuration above            
+# USE_FLASH_ATTN is set by the auto-configuration above      
+
+
+
 
 # ─── imports ─────────────────────────────────────────────────────────────
-import requests, torch, torch.nn as nn, torch.nn.functional as F
-from pathlib import Path
-from tqdm import tqdm
-import modal, wandb, copy
-from collections import defaultdict, deque
-import numpy as np
 import math
-from typing import Dict, List, Tuple, Optional
+import requests
+from pathlib import Path
+from collections import defaultdict, deque
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
-from functools import partial
+import numpy as np
+import wandb
+import modal
 
-stub = modal.App("grpo-dense-v2-reference-logging")
+stub = modal.App("grpo-dense-v2-rope-qknorm")
 
-# Modal image with Flash Attention
-flash_attn_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+# Flash‑Attention wheel (CUDA 12.3 + Torch 2.3). Change if needed.
+FLASH_WHEEL = (
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/"
+    "flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("numpy", "torch==2.3.0", "tqdm", "wandb", "requests", "matplotlib", "nvidia-ml-py3")
-    .pip_install(flash_attn_wheel)
+    .pip_install(
+        "numpy",
+        "torch==2.3.0",
+        "tqdm",
+        "wandb",
+        "requests",
+        "matplotlib",
+        "nvidia-ml-py3",
+    )
+    .pip_install(FLASH_WHEEL)
 )
 
-DATA_URL = ("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/"
-            "tinyshakespeare/input.txt")
+DATA_URL = (
+    "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/"
+    "tinyshakespeare/input.txt"
+)
 
-# ─── Data Loader ─────────────────────────────────────────────────────────
+# ─── RoPE helpers ────────────────────────────────────────────────────────
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x[..., ::2], x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+class RotaryCache(nn.Module):
+    def __init__(self, head_dim: int, max_len: int):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2) / head_dim))
+        t = torch.arange(max_len)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)  # (max_len, d/2)
+        sin, cos = freqs.sin(), freqs.cos()
+        self.register_buffer("sin_base", sin, persistent=False)
+        self.register_buffer("cos_base", cos, persistent=False)
+
+    def forward(self, seq_len: int):
+        sin = self.sin_base[:seq_len].repeat_interleave(2, dim=-1)
+        cos = self.cos_base[:seq_len].repeat_interleave(2, dim=-1)
+        return sin[None, None, :, :], cos[None, None, :, :]
+
+
+# ─── Data loader (unchanged) ─────────────────────────────────────────────
 class ContextualTextLoader:
-    """Provides longer context windows for better prediction"""
-    def __init__(self, text, enc, B, T, context_len, device='cuda'):
+    def __init__(self, text, enc, B, T, context_len, device="cuda"):
         self.data = enc(text)
         self.B, self.T, self.context_len = B, T, context_len
         self.device = device
-        self.pos = context_len  # Start after we have enough context
-        
-    def next(self):
-        # Ensure we have enough context
-        if self.pos + self.B*self.T + 1 > len(self.data):
-            self.pos = self.context_len
-            
-        contexts = []
-        targets = []
-        
-        for b in range(self.B):
-            # Get context window using sliding approach
-            ctx_start = self.pos - self.context_len + b*self.T
-            ctx_end = self.pos + b*self.T
-            
-            context = self.data[ctx_start:ctx_end]
-            target = self.data[ctx_end:ctx_end + self.T]
-            
-            contexts.append(context)
-            targets.append(target)
-        
-        self.pos += self.B * self.T
-        
-        return (torch.stack(contexts).to(self.device), 
-                torch.stack(targets).to(self.device))
+        self.pos = context_len
 
-# ─── Optimized Attention Block ───────────────────────────────────────────
+    def next(self):
+        if self.pos + self.B * self.T + 1 > len(self.data):
+            self.pos = self.context_len
+        ctx, tgt = [], []
+        for b in range(self.B):
+            s = self.pos - self.context_len + b * self.T
+            e = self.pos + b * self.T
+            ctx.append(self.data[s:e])
+            tgt.append(self.data[e : e + self.T])
+        self.pos += self.B * self.T
+        return torch.stack(ctx).to(self.device), torch.stack(tgt).to(self.device)
+
+
+# ─── Attention with RoPE + QK‑Norm ───────────────────────────────────────
 class OptimizedAttention(nn.Module):
-    """TorchTune-style optimized attention"""
-    def __init__(self, n_emb, n_head, dropout=0.1):
+    def __init__(self, n_emb: int, n_head: int, dropout: float = 0.1, max_seq: int = CONTEXT_LEN + HORIZON):
         super().__init__()
+        assert n_emb % n_head == 0
         self.n_head = n_head
-        self.n_emb = n_emb
         self.head_dim = n_emb // n_head
-        
-        # Fused QKV projection for efficiency
         self.qkv = nn.Linear(n_emb, 3 * n_emb, bias=False)
         self.o_proj = nn.Linear(n_emb, n_emb, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        
-        # Try to use Flash Attention
-        self.use_flash_attn = False
+        self.drop = nn.Dropout(dropout)
+        self.rope = RotaryCache(self.head_dim, max_seq)
+
+        self.use_flash = False
         if USE_FLASH_ATTN:
             try:
                 from flash_attn import flash_attn_qkvpacked_func
-                self.flash_attn_func = flash_attn_qkvpacked_func
-                self.use_flash_attn = True
-            except:
+
+                self.flash_func = flash_attn_qkvpacked_func
+                self.use_flash = True
+            except Exception:
                 pass
-                
-    def forward(self, x, mask=None):
+
+    @staticmethod
+    def _qk_norm(q: torch.Tensor, k: torch.Tensor, eps: float = 1e-6):
+        q = q * torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True) + eps)
+        k = k * torch.rsqrt(k.pow(2).mean(dim=-1, keepdim=True) + eps)
+        return q, k
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
         B, T, C = x.shape
-        
-        # Compute QKV in one go
-        qkv = self.qkv(x).reshape(B, T, 3, self.n_head, self.head_dim)
-        
-        if self.use_flash_attn:
-            # Flash Attention requires fp16 or bf16
-            input_dtype = qkv.dtype
-            if input_dtype not in [torch.float16, torch.bfloat16]:
-                qkv = qkv.to(torch.bfloat16)
-            
-            # Use Flash Attention
-            attn_out = self.flash_attn_func(qkv, causal=True, dropout_p=0.1 if self.training else 0.0)
-            attn_out = attn_out.reshape(B, T, C)
-            
-            # Convert back to original dtype if needed
-            if attn_out.dtype != input_dtype:
-                attn_out = attn_out.to(input_dtype)
+        qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)  # each (B, T, h, d)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B, h, T, d)
+
+        sin, cos = self.rope(T)
+        q, k = (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
+        q, k = self._qk_norm(q, k) # added qk norm for stable gradients and efficient training
+
+        if self.use_flash:
+            packed = torch.stack((q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)), dim=2)  # (B, T, 3, h, d)
+            dtype0 = packed.dtype
+            if dtype0 not in (torch.float16, torch.bfloat16):
+                packed = packed.to(torch.bfloat16)
+            out = self.flash_func(packed, causal=True, dropout_p=0.1 if self.training else 0.0)  # (B, T, h, d)
+            out = out.to(dtype0).reshape(B, T, C)  # FIX: merge head dim
         else:
-            # Standard attention with memory-efficient implementation
-            q, k, v = qkv.unbind(dim=2)
-            q = q.transpose(1, 2)  # (B, n_head, T, head_dim)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            
-            # Scaled dot-product attention
-            scale = self.head_dim ** -0.5
-            scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-            
+            scores = torch.matmul(q, k.transpose(-2, -1))  # (B, h, T, T)
             if mask is not None:
-                scores.masked_fill_(mask[None, None, :T, :T], float('-inf'))
-                
-            attn = F.softmax(scores, dim=-1)
-            attn = self.dropout(attn)
-            
-            attn_out = torch.matmul(attn, v)
-            attn_out = attn_out.transpose(1, 2).reshape(B, T, C)
-        
-        return self.o_proj(attn_out)
+                scores = scores.masked_fill(mask[None, None, :T, :T], float("-inf"))
+            attn = self.drop(F.softmax(scores, dim=-1))
+            out = torch.matmul(attn, v)  # (B, h, T, d)
+            out = out.transpose(1, 2).reshape(B, T, C)
 
-# ─── Helper function for RMSNorm ─────────────────────────────────────────
-def norm(x):
-    """RMSNorm implementation - compatible with PyTorch 2.3"""
-    # RMS normalization: x / sqrt(mean(x^2) + eps)
-    eps = 1e-5
-    var = x.pow(2).mean(dim=-1, keepdim=True)
-    return x * torch.rsqrt(var + eps)
+        return self.o_proj(out)
 
-# ─── Transformer Block ──────────────────────────────────────────────────
+
+# ─── Transformer block ─────────────────────────────────────────────────--
 class TransformerBlock(nn.Module):
-    def __init__(self, n_emb, n_head, dropout=0.1):
+    def __init__(self, n_emb: int, n_head: int, dropout: float = 0.1):
         super().__init__()
         self.attn = OptimizedAttention(n_emb, n_head, dropout)
-        
-        # Fused FFN operations
         self.ffn = nn.Sequential(
             nn.Linear(n_emb, 4 * n_emb, bias=False),
-            nn.GELU(approximate='tanh'),  # Faster GELU approximation
+            nn.GELU(approximate="tanh"),
             nn.Linear(4 * n_emb, n_emb, bias=False),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
         )
-        
-    def forward(self, x, mask=None):
-        # Pre-norm architecture with RMSNorm
-        x = x + self.attn(norm(x), mask)
-        x = x + self.ffn(norm(x))
+
+    @staticmethod
+    def _rms(x: torch.Tensor, eps: float = 1e-5):
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
+        x = x + self.attn(self._rms(x), mask)
+        x = x + self.ffn(self._rms(x))
         return x
 
-# ─── GPT Model ──────────────────────────────────────────────────────────
+
+# ─── GPT wrapper ─────────────────────────────────────────────────────────
 class GPT(nn.Module):
-    def __init__(self, V, n_layer=N_LAYER, n_head=N_HEAD, n_emb=N_EMB, 
-                 context_len=CONTEXT_LEN):
+    def __init__(self, vocab_size: int, n_layer: int = N_LAYER, n_head: int = N_HEAD, n_emb: int = N_EMB, context_len: int = CONTEXT_LEN + HORIZON):
         super().__init__()
         self.context_len = context_len
-        self.n_layer = n_layer
-        
-        # Embeddings
-        self.wte = nn.Embedding(V, n_emb)
-        self.wpe = nn.Embedding(context_len + HORIZON, n_emb)
+        self.wte = nn.Embedding(vocab_size, n_emb)
         self.drop = nn.Dropout(0.1)
-        
-        # Transformer blocks
-        self.layers = nn.ModuleList([
-            TransformerBlock(n_emb, n_head, dropout=0.1)
-            for _ in range(n_layer)
-        ])
-        
-        self.head = nn.Linear(n_emb, V, bias=False)
-        self.head.weight = self.wte.weight  # Weight tying
-        
-        # Initialize weights
-        self.apply(self._init_weights)
-        
-        # Pre-compute causal mask on correct device
-        self.register_buffer("causal_mask", torch.triu(
-            torch.ones(context_len + HORIZON, context_len + HORIZON), diagonal=1
-        ).bool())
-        
-    def _init_weights(self, module):
+        self.blocks = nn.ModuleList([TransformerBlock(n_emb, n_head) for _ in range(n_layer)])
+        self.head = nn.Linear(n_emb, vocab_size, bias=False)
+        self.head.weight = self.wte.weight  # weight tying
+        self.apply(self._init)
+        self.register_buffer("mask", torch.triu(torch.ones(context_len, context_len), 1).bool(), persistent=False)
+
+    @staticmethod
+    def _init(module: nn.Module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, 0.0, 0.02)
             if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+                nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            
-    def forward(self, idx, use_cache=False):
+            nn.init.normal_(module.weight, 0.0, 0.02)
+
+    @staticmethod
+    def _rms(x: torch.Tensor, eps: float = 1e-5):
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+
+    def forward(self, idx: torch.Tensor):
         B, T = idx.shape
-        pos = torch.arange(T, device=idx.device)
-        
-        # Embeddings
-        tok_emb = self.wte(idx)
-        pos_emb = self.wpe(pos)
-        x = self.drop(tok_emb + pos_emb)
-        
-        # Get mask
-        mask = self.causal_mask[:T, :T]
-        
-        # Forward through layers
-        for layer in self.layers:
-            x = layer(x, mask)
-        
-        x = norm(x)  # RMSNorm instead of LayerNorm
-        logits = self.head(x)
-        
-        return logits
+        x = self.drop(self.wte(idx))
+        m = self.mask[:T, :T]
+        for blk in self.blocks:
+            x = blk(x, m)
+        x = self._rms(x)
+        return self.head(x)
+
+
+\
 
 # ─── Helper functions ─────────────────────────────────────────────────────
 def ensure_dataset(p="input.txt"):
