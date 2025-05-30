@@ -167,6 +167,8 @@ cython_debug/
 claude-workspace/
 *.claude-backup
 *.claude-tmp
+CLAUDE.md
+TODO.md
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
