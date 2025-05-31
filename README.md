@@ -89,3 +89,18 @@ contributions are welcome! please feel free to submit a pull request.
 ## license
 
 this project is licensed under the apache 2.0 license - see the [license](license) file for details.
+
+## citation
+
+if you find this work useful in your research, please consider citing:
+
+```bibtex
+@software{avatarL2025,
+  author = {tokenbender},
+  title = {avataRL: Training Language Models from Scratch with Pure Reinforcement Learning},
+  year = {2025},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  url = {https://github.com/tokenbender/avataRL}
+}
+```
