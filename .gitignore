@@ -169,6 +169,7 @@ claude-workspace/
 *.claude-tmp
 CLAUDE.md
 TODO.md
+BRAINSTORM.md
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

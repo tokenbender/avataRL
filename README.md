@@ -79,6 +79,8 @@ monolith hackable script for modal deployment, just install modal via pip
 
 **current** thinking of how to boostrap with sparse rewards to match pretrain level performance. would create a thinking md file.
 
+all the progress and ideas are documented in the THINKING.md file for reference.
+
 
 ## contributing
 
