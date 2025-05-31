@@ -76,6 +76,15 @@ image = (
 
 DATA_URL = ("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/"
             "tinyshakespeare/input.txt")
+#Helpers
+
+#Pad Values for proper GPU util
+def next_power_of_two(n: int) -> int:
+    """
+    Return the smallest power of two >= n.
+    Assumes n >= 1.
+    """
+    return 1 << (n - 1).bit_length()
 
 
 # RoPE Helper functions
@@ -290,7 +299,9 @@ def build_vocab(p="input.txt"):
     itos  = {i:ch for ch,i in stoi.items()}
     def enc(s): return torch.tensor([stoi[c] for c in s], dtype=torch.long)
     def dec(t): return "".join(itos[int(i)] for i in t)
-    return enc, dec, len(chars), stoi, itos, text
+    V = len(chars)
+    V_padded = next_power_of_two(V)
+    return enc, dec, V_padded, stoi, itos, text
 
 class BigramRef(nn.Module):
     def __init__(self, bigram_counts, V, smoothing=1.0):
