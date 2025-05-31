@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 """
-GRPO Dense GPT – V2 with Flash‑Attention with  RoPE & QK‑Norm
-===========================================================
-
+GRPO Dense GPT - V2 Style with Flash Attention
+Simplified implementation focusing on:
+- GRPO V2 training dynamics
+- Flash Attention for efficient computation
+- Mixed precision training
 """
 
 # ─── hyper-params ────────────────────────────────────────────────────────
@@ -47,55 +49,36 @@ SAMPLE_INTERVAL = 20
 # Mixed precision
 USE_AMP = True                    
 AMP_DTYPE = "bfloat16"           
-# USE_FLASH_ATTN is set by the auto-configuration above      
-
-
-
+# USE_FLASH_ATTN is set by the auto-configuration above            
 
 # ─── imports ─────────────────────────────────────────────────────────────
-import math
-import requests
+import requests, torch, torch.nn as nn, torch.nn.functional as F
 from pathlib import Path
-from collections import defaultdict, deque
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from tqdm import tqdm
-from torch.cuda.amp import autocast, GradScaler
+import modal, wandb, copy
+from collections import defaultdict, deque
 import numpy as np
-import wandb
-import modal
+import math
+from typing import Dict, List, Tuple, Optional
+from torch.cuda.amp import autocast, GradScaler
+from functools import partial
 
-stub = modal.App("grpo-dense-v2-rope-qknorm")
+stub = modal.App("grpo-dense-v2-reference-logging")
 
-# Flash‑Attention wheel (CUDA 12.3 + Torch 2.3). Change if needed.
-FLASH_WHEEL = (
-    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/"
-    "flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
-)
+# Modal image with Flash Attention
+flash_attn_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install(
-        "numpy",
-        "torch==2.3.0",
-        "tqdm",
-        "wandb",
-        "requests",
-        "matplotlib",
-        "nvidia-ml-py3",
-    )
-    .pip_install(FLASH_WHEEL)
+    .pip_install("numpy", "torch==2.5.0", "tqdm", "wandb", "requests", "matplotlib", "nvidia-ml-py3")
+    .pip_install(flash_attn_wheel)
 )
 
-DATA_URL = (
-    "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/"
-    "tinyshakespeare/input.txt"
-)
+DATA_URL = ("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/"
+            "tinyshakespeare/input.txt")
 
-# ─── RoPE helpers ────────────────────────────────────────────────────────
 
+# RoPE Helper functions
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x[..., ::2], x[..., 1::2]
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
@@ -117,142 +100,183 @@ class RotaryCache(nn.Module):
         return sin[None, None, :, :], cos[None, None, :, :]
 
 
-# ─── Data loader (unchanged) ─────────────────────────────────────────────
+# ─── Data Loader ─────────────────────────────────────────────────────────
 class ContextualTextLoader:
-    def __init__(self, text, enc, B, T, context_len, device="cuda"):
+    """Provides longer context windows for better prediction"""
+    def __init__(self, text, enc, B, T, context_len, device='cuda'):
         self.data = enc(text)
         self.B, self.T, self.context_len = B, T, context_len
         self.device = device
-        self.pos = context_len
-
+        self.pos = context_len  # Start after we have enough context
+        
     def next(self):
-        if self.pos + self.B * self.T + 1 > len(self.data):
+        # Ensure we have enough context
+        if self.pos + self.B*self.T + 1 > len(self.data):
             self.pos = self.context_len
-        ctx, tgt = [], []
+            
+        contexts = []
+        targets = []
+        
         for b in range(self.B):
-            s = self.pos - self.context_len + b * self.T
-            e = self.pos + b * self.T
-            ctx.append(self.data[s:e])
-            tgt.append(self.data[e : e + self.T])
+            # Get context window using sliding approach
+            ctx_start = self.pos - self.context_len + b*self.T
+            ctx_end = self.pos + b*self.T
+            
+            context = self.data[ctx_start:ctx_end]
+            target = self.data[ctx_end:ctx_end + self.T]
+            
+            contexts.append(context)
+            targets.append(target)
+        
         self.pos += self.B * self.T
-        return torch.stack(ctx).to(self.device), torch.stack(tgt).to(self.device)
+        
+        return (torch.stack(contexts).to(self.device), 
+                torch.stack(targets).to(self.device))
 
-
-# ─── Attention with RoPE + QK‑Norm ───────────────────────────────────────
+# ─── Optimized Attention Block ───────────────────────────────────────────
 class OptimizedAttention(nn.Module):
-    def __init__(self, n_emb: int, n_head: int, dropout: float = 0.1, max_seq: int = CONTEXT_LEN + HORIZON):
+    """TorchTune-style optimized attention"""
+    def __init__(self, n_emb, n_head, dropout=0.1):
         super().__init__()
-        assert n_emb % n_head == 0
         self.n_head = n_head
+        self.n_emb = n_emb
         self.head_dim = n_emb // n_head
+        
+        # Fused QKV projection for efficiency
         self.qkv = nn.Linear(n_emb, 3 * n_emb, bias=False)
         self.o_proj = nn.Linear(n_emb, n_emb, bias=False)
-        self.drop = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
+        max_seq = CONTEXT_LEN + HORIZON
         self.rope = RotaryCache(self.head_dim, max_seq)
-
-        self.use_flash = False
+        # Try to use Flash Attention
+        self.use_flash_attn = False
         if USE_FLASH_ATTN:
             try:
                 from flash_attn import flash_attn_qkvpacked_func
-
-                self.flash_func = flash_attn_qkvpacked_func
-                self.use_flash = True
-            except Exception:
+                self.flash_attn_func = flash_attn_qkvpacked_func
+                self.use_flash_attn = True
+            except:
                 pass
-
-    @staticmethod
-    def _qk_norm(q: torch.Tensor, k: torch.Tensor, eps: float = 1e-6):
-        q = q * torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True) + eps)
-        k = k * torch.rsqrt(k.pow(2).mean(dim=-1, keepdim=True) + eps)
-        return q, k
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
+    
+                
+    def forward(self, x, mask=None):
         B, T, C = x.shape
-        qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim)
+        
+        # Compute QKV in one go
+        qkv = self.qkv(x).reshape(B, T, 3, self.n_head, self.head_dim)
+        
         q, k, v = qkv.unbind(dim=2)  # each (B, T, h, d)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B, h, T, d)
 
         sin, cos = self.rope(T)
         q, k = (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
-        q, k = self._qk_norm(q, k) # added qk norm for stable gradients and efficient training
+        q, k = norm(q), norm(k) # added qk norm for stable gradients and efficient training
 
-        if self.use_flash:
+        if self.use_flash_attn:
             packed = torch.stack((q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)), dim=2)  # (B, T, 3, h, d)
             dtype0 = packed.dtype
             if dtype0 not in (torch.float16, torch.bfloat16):
                 packed = packed.to(torch.bfloat16)
-            out = self.flash_func(packed, causal=True, dropout_p=0.1 if self.training else 0.0)  # (B, T, h, d)
+            out = self.flash_attn_func(packed, causal=True, dropout_p=0.1 if self.training else 0.0)  # (B, T, h, d)
             out = out.to(dtype0).reshape(B, T, C)  # FIX: merge head dim
         else:
-            scores = torch.matmul(q, k.transpose(-2, -1))  # (B, h, T, T)
-            if mask is not None:
-                scores = scores.masked_fill(mask[None, None, :T, :T], float("-inf"))
-            attn = self.drop(F.softmax(scores, dim=-1))
-            out = torch.matmul(attn, v)  # (B, h, T, d)
-            out = out.transpose(1, 2).reshape(B, T, C)
+            # Standard attention with memory-efficient implementation
+            q, k, v = qkv.unbind(dim=2)
+            q = q.transpose(1, 2)  # (B, n_head, T, head_dim)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            
+            # Scaled dot-product attention
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2).contiguous().view(B, T, C) 
+            out = self.o_proj(y)
+        return out
 
-        return self.o_proj(out)
+# ─── Helper function for RMSNorm ─────────────────────────────────────────
+def norm(x):
+    """RMSNorm implementation - compatible with PyTorch 2.3"""
+    # RMS normalization: x / sqrt(mean(x^2) + eps)
+    return F.rms_norm(x, (x.size(-1),))
 
 
-# ─── Transformer block ─────────────────────────────────────────────────--
+# ─── Transformer Block ──────────────────────────────────────────────────
 class TransformerBlock(nn.Module):
-    def __init__(self, n_emb: int, n_head: int, dropout: float = 0.1):
+    def __init__(self, n_emb, n_head, dropout=0.1):
         super().__init__()
         self.attn = OptimizedAttention(n_emb, n_head, dropout)
+        
+        # Fused FFN operations
         self.ffn = nn.Sequential(
             nn.Linear(n_emb, 4 * n_emb, bias=False),
-            nn.GELU(approximate="tanh"),
+            nn.GELU(approximate='tanh'),  # Faster GELU approximation
             nn.Linear(4 * n_emb, n_emb, bias=False),
-            nn.Dropout(dropout),
+            nn.Dropout(dropout)
         )
-
-    @staticmethod
-    def _rms(x: torch.Tensor, eps: float = 1e-5):
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
-        x = x + self.attn(self._rms(x), mask)
-        x = x + self.ffn(self._rms(x))
+        
+    def forward(self, x, mask=None):
+        # Pre-norm architecture with RMSNorm
+        x = x + self.attn(norm(x), mask)
+        x = x + self.ffn(norm(x))
         return x
 
-
-# ─── GPT wrapper ─────────────────────────────────────────────────────────
+# ─── GPT Model ──────────────────────────────────────────────────────────
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, n_layer: int = N_LAYER, n_head: int = N_HEAD, n_emb: int = N_EMB, context_len: int = CONTEXT_LEN + HORIZON):
+    def __init__(self, V, n_layer=N_LAYER, n_head=N_HEAD, n_emb=N_EMB, 
+                 context_len=CONTEXT_LEN):
         super().__init__()
         self.context_len = context_len
-        self.wte = nn.Embedding(vocab_size, n_emb)
+        self.n_layer = n_layer
+        
+        # Embeddings
+        self.wte = nn.Embedding(V, n_emb)
+        # self.wpe = nn.Embedding(context_len + HORIZON, n_emb)
         self.drop = nn.Dropout(0.1)
-        self.blocks = nn.ModuleList([TransformerBlock(n_emb, n_head) for _ in range(n_layer)])
-        self.head = nn.Linear(n_emb, vocab_size, bias=False)
-        self.head.weight = self.wte.weight  # weight tying
-        self.apply(self._init)
-        self.register_buffer("mask", torch.triu(torch.ones(context_len, context_len), 1).bool(), persistent=False)
-
-    @staticmethod
-    def _init(module: nn.Module):
+        
+        # Transformer blocks
+        self.layers = nn.ModuleList([
+            TransformerBlock(n_emb, n_head, dropout=0.1)
+            for _ in range(n_layer)
+        ])
+        
+        self.head = nn.Linear(n_emb, V, bias=False)
+        self.head.weight = self.wte.weight  # Weight tying
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+        
+        # Pre-compute causal mask on correct device
+        self.register_buffer("causal_mask", torch.triu(
+            torch.ones(context_len + HORIZON, context_len + HORIZON), diagonal=1
+        ).bool())
+        
+    def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, 0.0, 0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
-                nn.init.zeros_(module.bias)
+                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, 0.0, 0.02)
-
-    @staticmethod
-    def _rms(x: torch.Tensor, eps: float = 1e-5):
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-
-    def forward(self, idx: torch.Tensor):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            
+    def forward(self, idx, use_cache=False):
         B, T = idx.shape
-        x = self.drop(self.wte(idx))
-        m = self.mask[:T, :T]
-        for blk in self.blocks:
-            x = blk(x, m)
-        x = self._rms(x)
-        return self.head(x)
-
-
-\
+        
+        
+        # Embeddings
+        tok_emb = self.wte(idx)
+        
+        x = self.drop(tok_emb)
+        
+        # Get mask
+        mask = self.causal_mask[:T, :T]
+        
+        # Forward through layers
+        for layer in self.layers:
+            x = layer(x, mask)
+        
+        x = norm(x)  # RMSNorm instead of LayerNorm
+        logits = self.head(x)
+        
+        return logits
 
 # ─── Helper functions ─────────────────────────────────────────────────────
 def ensure_dataset(p="input.txt"):
@@ -316,7 +340,7 @@ def generate_with_temperature(model, contexts, horizon, K, temperature=1.0):
     for _ in range(horizon):
         ctx_window = ctx[:, -model.context_len:] if ctx.shape[1] > model.context_len else ctx
         
-        with autocast(enabled=USE_AMP, dtype=torch.bfloat16 if AMP_DTYPE == "bfloat16" else torch.float16):
+        with torch.amp.autocast('cuda',dtype = torch.bfloat16):
             logits = model(ctx_window)[:, -1, :] / temperature
         
         probs = F.softmax(logits, dim=-1)
@@ -538,7 +562,7 @@ def train_remote():
             ctx_for_loss = ctx.repeat_interleave(K_SAMPLES, dim=0)
             full_seq = torch.cat([ctx_for_loss, flat_G], dim=1)
             
-            with autocast(enabled=USE_AMP, dtype=torch.bfloat16):
+            with torch.amp.autocast('cuda',dtype = torch.bfloat16):
                 input_seq = full_seq[:, -actor.context_len:]
                 
                 new_logits = actor(input_seq)
@@ -654,7 +678,7 @@ def train_remote():
             with torch.no_grad():
                 val_ctx, val_ref = loader.next()
                 
-                with autocast(enabled=USE_AMP, dtype=torch.bfloat16):
+                with torch.amp.autocast('cuda',dtype = torch.bfloat16):
                     val_logits = actor(val_ctx)
                     val_logits = val_logits[:, -HORIZON:, :]
                     
