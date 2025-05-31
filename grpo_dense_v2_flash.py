@@ -108,6 +108,18 @@ class RotaryCache(nn.Module):
         cos = self.cos_base[:seq_len].repeat_interleave(2, dim=-1)
         return sin[None, None, :, :], cos[None, None, :, :]
 
+class ReLUSquared(nn.Module):
+    """
+    A feed-forward activation layer that computes (ReLU(x))**2.
+    """
+    def __init__(self):
+        super().__init__()
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.relu(x)
+        return y * y
+
 
 # ─── Data Loader ─────────────────────────────────────────────────────────
 class ContextualTextLoader:
@@ -217,7 +229,7 @@ class TransformerBlock(nn.Module):
         # Fused FFN operations
         self.ffn = nn.Sequential(
             nn.Linear(n_emb, 4 * n_emb, bias=False),
-            nn.GELU(approximate='tanh'),  # Faster GELU approximation
+            ReLUSquared(),  # Faster GELU approximation
             nn.Linear(4 * n_emb, n_emb, bias=False),
             nn.Dropout(dropout)
         )
@@ -299,9 +311,7 @@ def build_vocab(p="input.txt"):
     itos  = {i:ch for ch,i in stoi.items()}
     def enc(s): return torch.tensor([stoi[c] for c in s], dtype=torch.long)
     def dec(t): return "".join(itos[int(i)] for i in t)
-    V = len(chars)
-    V_padded = next_power_of_two(V)
-    return enc, dec, V_padded, stoi, itos, text
+    return enc, dec, len(chars), stoi, itos, text
 
 class BigramRef(nn.Module):
     def __init__(self, bigram_counts, V, smoothing=1.0):
@@ -336,7 +346,7 @@ def build_bigram_counts(text, stoi):
 
 # ─── Temperature-based generation (from v2) ──────────────────────────────
 @torch.no_grad()
-def generate_with_temperature(model, contexts, horizon, K, temperature=1.0):
+def generate_with_temperature(model, contexts, horizon, K,V_ORIG, temperature=1.0):
     """
     Generate K samples with temperature-based sampling
     Optimized version using CUDA graphs when possible
@@ -353,7 +363,7 @@ def generate_with_temperature(model, contexts, horizon, K, temperature=1.0):
         
         with torch.amp.autocast('cuda',dtype = torch.bfloat16):
             logits = model(ctx_window)[:, -1, :] / temperature
-        
+        logits[:, V_ORIG:] = -1e9
         probs = F.softmax(logits, dim=-1)
         next_char = torch.multinomial(probs, 1)
         ctx = torch.cat([ctx, next_char], dim=1)
@@ -455,6 +465,11 @@ def train_remote():
     DEV = "cuda"
     ensure_dataset()
     ENC, DEC, V, stoi, itos, text = build_vocab()
+    V_ORIG = V
+    V = next_power_of_two(V)
+    for i in range(V_ORIG, V):
+        itos[i] = "<pad>"
+    stoi["<pad>"] = V_ORIG
     
     print(f"Starting GRPO V2 training with Flash Attention")
     print(f"Vocabulary size: {V}")
@@ -537,7 +552,7 @@ def train_remote():
             
             # Generate samples with temperature-based sampling
             with torch.no_grad():
-                G = generate_with_temperature(actor_old, ctx, HORIZON, K_SAMPLES, temperature=TEMPERATURE)
+                G = generate_with_temperature(actor_old, ctx, HORIZON, K_SAMPLES,V_ORIG, temperature=TEMPERATURE)
             
             # Calculate rewards
             R = torch.zeros_like(G, dtype=torch.float32)
@@ -669,7 +684,7 @@ def train_remote():
                 for i, temp in enumerate([0.8, 1.0, 1.2]):
                     if i < test_ctx.shape[0]:
                         gen = generate_with_temperature(
-                            actor, test_ctx[i:i+1], 150, 1, temperature=temp
+                            actor, test_ctx[i:i+1], 150, 1,V_ORIG, temperature=temp
                         )[0, 0]
                         
                         sample_text = DEC(gen)
