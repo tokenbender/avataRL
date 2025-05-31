@@ -73,7 +73,7 @@ monolith hackable script for modal deployment, just install modal via pip
 ## progress
 **28May25**] so since here i am starting with random weights, i wished to find a way to bootstrap this. and for rl, i am starting with grpo algo. 
 
-**29May25** i was able to get positive rewards, the approach i tried was to have a bigram objective for partial scoring of predictions and groundtruth, i am getting positive rewards and after like 80% of the run, it is matching bigram level performance and then drops off. (TODO - add wandb link and link the older script used for it.)
+**29May25** i was able to get positive rewards, the approach i tried was to have a bigram objective for partial scoring of predictions and groundtruth, i am getting positive rewards and after like 80% of the run, it is matching bigram level performance and then drops off. see [wandb runs](https://wandb.ai/ahm-rimer/gpt2-grpo-v2/reports/avataRL-runs--VmlldzoxMzAzOTU3Mw) for detailed metrics.
 
 **30May25** So i figured i could ramp up the ngrams. trigram after bigram and so on, but this approach is going to scale badly. so i decided to think deeper on this. since i need to run many experiments with limited personal budget, i improved speed from 27-30min previously to 2min50s current. now i can do 10x more experiments and it is a good base.
 
