@@ -1,19 +1,12 @@
 #!/usr/bin/env python
-"""
-GRPO Dense GPT - V2 Style with Flash Attention
-Simplified implementation focusing on:
-- GRPO V2 training dynamics
-- Flash Attention for efficient computation
-- Mixed precision training
-"""
 
-# ─── hyper-params ────────────────────────────────────────────────────────
+# Hyperparameters
 CONTEXT_LEN = 8                   # Sliding window context
 HORIZON = 1                       # Single character prediction for exhaustive exploration
 BATCH = 4096                      # Large batch via accumulation
 MICRO_BATCH = 512                 # Moderate micro-batch 
 GRAD_ACCUM = BATCH // MICRO_BATCH # 8 gradient accumulation steps
-EPOCHS = 1                        # Number of epochs to train
+EPOCHS = 3                        # Number of epochs to train
 DATASET_SIZE = 1_115_394          # Exact size of TinyShakespeare in characters
 ITERS_PER_EPOCH = DATASET_SIZE // BATCH  # ~2,178 iterations per epoch
 TOTAL_ITERS = ITERS_PER_EPOCH * EPOCHS   # Total training iterations
@@ -24,10 +17,14 @@ NEG_REWARD = False                # No negative rewards
 GPU_TYPE = "H100"                 
 CLIP_RATIO = 0.5                  # PPO clip ratio
 K_SAMPLES = 65                    # We explore ALL 65 characters exhaustively
-ENTROPY_COEF = 0.01               # Entropy bonus coefficient
+ENTROPY_COEF = 0.08               # Entropy bonus coefficient
 TEMPERATURE = 1.2                 # Sampling temperature (not used in exhaustive)
 MIN_VARIANCE = 0.1                # Minimum advantage variance
-USE_EXHAUSTIVE = True             # Use exhaustive exploration                
+USE_EXHAUSTIVE = True             # Use exhaustive exploration
+USE_CONFIDENCE_SCALING = True     # Enable confidence scaling rewards
+CONFIDENCE_WEIGHT = 0.5           # Conservative confidence scaling weight
+CONFIDENCE_CLIP = 2.0             # Maximum confidence scaling factor
+ENABLE_CONFIDENCE_PENALTY = False # Phase 2: Enable penalties for overconfident wrong predictions
 
 # Model architecture
 N_LAYER = 6                       
@@ -54,7 +51,7 @@ SAMPLE_INTERVAL = 20
 USE_AMP = True                    
 AMP_DTYPE = "bfloat16"           
 
-# ─── imports ─────────────────────────────────────────────────────────────
+# Imports
 import requests, torch, torch.nn as nn, torch.nn.functional as F
 from pathlib import Path
 from tqdm import tqdm
@@ -65,8 +62,9 @@ import math
 from typing import Dict, List, Tuple, Optional
 from torch.cuda.amp import autocast, GradScaler
 from functools import partial
+import warnings
 
-stub = modal.App("exhaustive-single-char-exploration-epoch1-batch-4096-microbatch512-v1")
+stub = modal.App("exhaustive-confidence-scaling-v2-h200-phase1")
 
 # Modal image with Flash Attention
 flash_attn_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
@@ -103,7 +101,6 @@ class RotaryCache(nn.Module):
         return sin[None, None, :, :], cos[None, None, :, :]
 
 
-# ─── Data Loader ─────────────────────────────────────────────────────────
 class ContextualTextLoader:
     """Provides longer context windows for better prediction"""
     def __init__(self, text, enc, B, T, context_len, device='cuda'):
@@ -136,7 +133,6 @@ class ContextualTextLoader:
         return (torch.stack(contexts).to(self.device), 
                 torch.stack(targets).to(self.device))
 
-# ─── Optimized Attention Block ───────────────────────────────────────────
 class OptimizedAttention(nn.Module):
     """TorchTune-style optimized attention"""
     def __init__(self, n_emb, n_head, dropout=0.1):
@@ -173,7 +169,7 @@ class OptimizedAttention(nn.Module):
 
         sin, cos = self.rope(T)
         q, k = (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
-        q, k = norm(q), norm(k) # added qk norm for stable gradients and efficient training
+        q, k = norm(q), norm(k)
 
         if self.use_flash_attn:
             packed = torch.stack((q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)), dim=2)  # (B, T, 3, h, d)
@@ -181,7 +177,7 @@ class OptimizedAttention(nn.Module):
             if dtype0 not in (torch.float16, torch.bfloat16):
                 packed = packed.to(torch.bfloat16)
             out = self.flash_attn_func(packed, causal=True, dropout_p=0.1 if self.training else 0.0)  # (B, T, h, d)
-            out = out.to(dtype0).reshape(B, T, C)  # FIX: merge head dim
+            out = out.to(dtype0).reshape(B, T, C)
         else:
             # Standard attention with memory-efficient implementation
             q, k, v = qkv.unbind(dim=2)
@@ -195,14 +191,12 @@ class OptimizedAttention(nn.Module):
             out = self.o_proj(y)
         return out
 
-# ─── Helper function for RMSNorm ─────────────────────────────────────────
 def norm(x):
     """RMSNorm implementation - compatible with PyTorch 2.3"""
     # RMS normalization: x / sqrt(mean(x^2) + eps)
     return F.rms_norm(x, (x.size(-1),))
 
 
-# ─── Transformer Block ──────────────────────────────────────────────────
 class TransformerBlock(nn.Module):
     def __init__(self, n_emb, n_head, dropout=0.1):
         super().__init__()
@@ -222,7 +216,6 @@ class TransformerBlock(nn.Module):
         x = x + self.ffn(norm(x))
         return x
 
-# ─── GPT Model ──────────────────────────────────────────────────────────
 class GPT(nn.Module):
     def __init__(self, V, n_layer=N_LAYER, n_head=N_HEAD, n_emb=N_EMB, 
                  context_len=CONTEXT_LEN):
@@ -281,7 +274,6 @@ class GPT(nn.Module):
         
         return logits
 
-# ─── Helper functions ─────────────────────────────────────────────────────
 def ensure_dataset(p="input.txt"):
     if not Path(p).exists():
         Path(p).write_text(requests.get(DATA_URL, timeout=10).text, encoding="utf-8")
@@ -334,7 +326,6 @@ def build_char_frequencies(text, stoi, V):
     char_freq = char_counts / char_counts.sum()
     return char_freq
 
-# ─── Temperature-based generation (from v2) ──────────────────────────────
 @torch.no_grad()
 def generate_with_temperature(model, contexts, horizon, K, temperature=1.0):
     """
@@ -362,7 +353,6 @@ def generate_with_temperature(model, contexts, horizon, K, temperature=1.0):
     generated = ctx[:, -horizon:].reshape(B, K, horizon)
     return generated
 
-# ─── Exhaustive single character generation ──────────────────────────────
 @torch.no_grad()
 def generate_exhaustive_single_char(model, contexts, V):
     """
@@ -385,11 +375,7 @@ def generate_exhaustive_single_char(model, contexts, V):
     
     return all_chars, log_probs
 
-# ─── Improved reward computation (from v2) ───────────────────────────────
 def compute_rewards(gen, ref, ref_logits):
-    """
-    Compute rewards with better scaling (adapted from v2)
-    """
     # Exact match reward (scaled up)
     exact_match = (gen == ref).float()
     
@@ -408,7 +394,6 @@ def compute_rewards(gen, ref, ref_logits):
     return reward
 
 def compute_rewards_batch(gen, ref, ref_logits):
-    """Compute rewards with detailed tracking"""
     reward = compute_rewards(gen, ref, ref_logits)
     exact_match = (gen == ref).float()
     
@@ -425,46 +410,65 @@ def compute_rewards_batch(gen, ref, ref_logits):
     
     return reward, exact_match, metrics
 
-def compute_exhaustive_rewards(all_chars, ref_char, ref_model, ctx, V):
-    """
-    Compute rewards for ALL possible next characters
-    all_chars: [B, V] - all possible characters for each batch
-    ref_char: [B] - the actual next character in Shakespeare
-    """
+def compute_exhaustive_rewards(all_chars, ref_char, ref_model, ctx, V, model_log_probs=None, old_probs=None):
     B = ctx.shape[0]
     device = ctx.device
-    
-    # Prepare for reward computation
-    rewards = torch.zeros(B, V, device=device)
-    
-    # Exact match reward - only the correct character gets this
-    for b in range(B):
-        rewards[b, ref_char[b]] = 2.0  # Exact match bonus
     
     # Get reference model's distribution
     with torch.no_grad():
         ref_logits = ref_model(ctx)[:, -1, :]  # [B, V]
-        ref_probs = F.softmax(ref_logits, dim=-1)  # [B, V]
+        ref_log_probs = F.log_softmax(ref_logits, dim=-1)  # [B, V]
         
-    # Partial credit based on reference probability
-    # Every character gets partial credit based on how likely it is
-    partial_rewards = torch.log(ref_probs + 1e-10) / 10.0
-    rewards += 0.1 * partial_rewards
+    # Base reward: negative log probability under reference model
+    base_rewards = -ref_log_probs  # [B, V]
     
-    # Character frequency reward (if we have computed it)
-    # This encourages matching Shakespeare's character distribution
+    # Scale rewards to increase variance (3x through scaling factor)
+    VARIANCE_SCALE = 3.0
+    base_rewards = base_rewards * VARIANCE_SCALE
+    
+    # Model improvement bonus
+    if model_log_probs is not None:
+        improvement = model_log_probs - ref_log_probs
+        improvement_bonus = torch.clamp(improvement, min=-1.0, max=2.0)
+        base_rewards = base_rewards + improvement_bonus
+    
+    # Exact match bonus
+    exact_match_bonus = torch.zeros_like(base_rewards)
+    for b in range(B):
+        exact_match_bonus[b, ref_char[b]] = 5.0 * VARIANCE_SCALE
+    
+    # Combine all rewards
+    rewards = base_rewards + exact_match_bonus
+    
+    # Confidence scaling
+    if USE_CONFIDENCE_SCALING and old_probs is not None:
+        confidence = old_probs[torch.arange(B), ref_char]
+        confidence_scale = 1.0 + CONFIDENCE_WEIGHT * confidence.clamp(0, 1)
+        confidence_scale = confidence_scale.clamp(1.0, CONFIDENCE_CLIP)
+        rewards[torch.arange(B), ref_char] *= confidence_scale
+        
+        # Phase 2: Penalize overconfident wrong predictions
+        if ENABLE_CONFIDENCE_PENALTY:
+            top_k = min(10, V)
+            top_probs, top_indices = old_probs.topk(top_k, dim=-1)
+            wrong_mask = top_indices != ref_char.unsqueeze(1)
+            confident_mask = top_probs > 0.5
+            penalty_mask = wrong_mask & confident_mask
+            penalties = -0.1 * top_probs * penalty_mask.float()
+            rewards.scatter_add_(1, top_indices, penalties)
+    
+    # Normalize rewards to have zero mean per batch
+    rewards = rewards - rewards.mean(dim=1, keepdim=True)
     
     return rewards
 
 def compute_entropy(logits):
-    """Compute entropy to measure model uncertainty"""
     probs = F.softmax(logits, dim=-1)
     log_probs = F.log_softmax(logits, dim=-1)
     entropy = -(probs * log_probs).sum(dim=-1)
     return entropy
 
 class AdaptiveKLController:
-    """Adaptive KL coefficient based on current KL divergence"""
     def __init__(self, target_kl, horizon=10):
         self.target_kl = target_kl
         self.horizon = horizon
@@ -491,7 +495,52 @@ class AdaptiveKLController:
         
         return max(1e-5, min(1.0, new_coef))
 
-# ─── Ultra-optimized training loop ───────────────────────────────────────
+
+class ConfidenceMonitor:
+    def __init__(self, calibration_threshold=0.15, confidence_collapse_threshold=0.8):
+        self.calibration_threshold = calibration_threshold
+        self.confidence_collapse_threshold = confidence_collapse_threshold
+        self.confidence_history = deque(maxlen=100)
+        self.accuracy_history = deque(maxlen=100)
+        self.gradient_history = deque(maxlen=50)
+        
+    def update(self, confidence, accuracy, gradient_norm=None):
+        self.confidence_history.append(confidence)
+        self.accuracy_history.append(accuracy)
+        if gradient_norm is not None:
+            self.gradient_history.append(gradient_norm)
+    
+    def check_calibration(self):
+        if len(self.confidence_history) < 50:
+            return True, 0.0
+        
+        avg_confidence = np.mean(self.confidence_history)
+        avg_accuracy = np.mean(self.accuracy_history)
+        calibration_error = abs(avg_confidence - avg_accuracy)
+        
+        is_calibrated = calibration_error < self.calibration_threshold
+        return is_calibrated, calibration_error
+    
+    def check_confidence_collapse(self):
+        if len(self.confidence_history) < 20:
+            return False, 0.0
+        
+        recent_confidence = list(self.confidence_history)[-20:]
+        high_conf_ratio = sum(c > self.confidence_collapse_threshold for c in recent_confidence) / len(recent_confidence)
+        
+        return high_conf_ratio > 0.7, high_conf_ratio
+    
+    def check_gradient_stability(self):
+        if len(self.gradient_history) < 10:
+            return True, 0.0
+        
+        recent_grads = list(self.gradient_history)[-10:]
+        grad_variance = np.var(recent_grads)
+        grad_trend = np.polyfit(range(len(recent_grads)), recent_grads, 1)[0]
+        
+        is_stable = grad_variance < 10.0 and grad_trend < 0.1
+        return is_stable, grad_variance
+
 @stub.function(
     gpu=GPU_TYPE, 
     image=image, 
@@ -542,10 +591,13 @@ def train_remote():
     loader = ContextualTextLoader(text, ENC, MICRO_BATCH, HORIZON, CONTEXT_LEN, device=DEV)
     kl_controller = AdaptiveKLController(KL_TARGET) if ADAPTIVE_KL else None
     
+    # Initialize confidence monitor
+    confidence_monitor = ConfidenceMonitor() if USE_CONFIDENCE_SCALING else None
+    
     # Initialize wandb
     run = wandb.init(
         project="avataRL",
-        name="exhaustive-single-char-exploration-epoch1-batch-4096-microbatch512-v1-h100",
+        name="exhaustive-confidence-scaling-phase1-v2-h200",
         config={
             "model": {
                 "vocab_size": V,
@@ -565,6 +617,10 @@ def train_remote():
                 "k_samples": K_SAMPLES,
                 "exhaustive_exploration": USE_EXHAUSTIVE,
                 "exploration_method": "exhaustive_all_chars" if USE_EXHAUSTIVE else "sampling",
+                "confidence_scaling": USE_CONFIDENCE_SCALING,
+                "confidence_weight": CONFIDENCE_WEIGHT,
+                "confidence_clip": CONFIDENCE_CLIP,
+                "confidence_penalty_enabled": ENABLE_CONFIDENCE_PENALTY,
             },
             "optimizations": {
                 "flash_attention": USE_FLASH_ATTN,
@@ -595,39 +651,42 @@ def train_remote():
             ctx, ref_tok = loader.next()
             
             if USE_EXHAUSTIVE and HORIZON == 1:
-                # Exhaustive exploration: try ALL 65 characters
                 with torch.no_grad():
                     all_chars, old_log_probs = generate_exhaustive_single_char(actor_old, ctx, V)
                     
-                # Compute rewards for ALL characters
-                ref_char = ref_tok[:, 0]  # First character is what we're predicting
-                R = compute_exhaustive_rewards(all_chars, ref_char, ref, ctx, V)  # [B, V]
+                ref_char = ref_tok[:, 0]
+                old_probs = torch.exp(old_log_probs) if USE_CONFIDENCE_SCALING else None
+                R = compute_exhaustive_rewards(all_chars, ref_char, ref, ctx, V, 
+                                             model_log_probs=old_log_probs,
+                                             old_probs=old_probs)
                 
-                # Calculate accuracy (how often model's top choice matches reference)
-                top_choice = old_log_probs.argmax(dim=-1)  # [B]
+                top_choice = old_log_probs.argmax(dim=-1)
                 accuracy = (top_choice == ref_char).float().mean().item()
                 all_metrics["accuracy"].append(accuracy)
                 
-                # Compute advantages across all V characters
-                base = R.mean(dim=1, keepdim=True)  # [B, 1]
-                adv = R - base  # [B, V]
+                all_metrics["reward_variance"].append(R.var().item())
+                all_metrics["reward_spread"].append((R.max() - R.min()).mean().item())
+                
+                if hasattr(actor_old, '_prev_log_probs'):
+                    prob_change = (old_log_probs - actor_old._prev_log_probs).abs().mean().item()
+                    all_metrics["prob_change"].append(prob_change)
+                actor_old._prev_log_probs = old_log_probs.detach()
+                
+                base = R.mean(dim=1, keepdim=True)
+                adv = R - base
                 adv_std = torch.maximum(adv.std(dim=1, keepdim=True), torch.tensor(MIN_VARIANCE, device=DEV))
                 adv = adv / adv_std
                 
-                # Store for logging
-                all_R.append(R.unsqueeze(2))  # Add time dimension for compatibility
+                all_R.append(R.unsqueeze(2))
                 all_adv.append(adv.unsqueeze(2))
                 
-                # Prepare for loss computation
-                flat_G = all_chars.reshape(-1, 1)  # [B*V, 1]
-                flat_adv = adv.reshape(-1, 1)  # [B*V, 1]
+                flat_G = all_chars.reshape(-1, 1)
+                flat_adv = adv.reshape(-1, 1)
                 
             else:
-                # Original sampling-based generation
                 with torch.no_grad():
                     G = generate_with_temperature(actor_old, ctx, HORIZON, K_SAMPLES, temperature=TEMPERATURE)
                 
-                # Calculate rewards
                 R = torch.zeros_like(G, dtype=torch.float32)
                 
                 for k in range(K_SAMPLES):
@@ -643,24 +702,19 @@ def train_remote():
                     for key, val in reward_metrics.items():
                         all_metrics[key].append(val)
                 
-                # Compute advantages
                 base = R.mean(dim=1, keepdim=True)
                 adv = R - base
                 adv_std = torch.maximum(adv.std(dim=1, keepdim=True), torch.tensor(MIN_VARIANCE, device=DEV))
                 adv = adv / adv_std
                 
-                # Store for logging
                 all_R.append(R)
                 all_adv.append(adv)
                 
-                # Flatten
                 flat_G = G.reshape(-1, HORIZON)
                 flat_adv = adv.reshape(-1, HORIZON)
             
-            # Forward pass
             if USE_EXHAUSTIVE and HORIZON == 1:
-                # For exhaustive, we need to expand context V times, not K_SAMPLES times
-                ctx_for_loss = ctx.repeat_interleave(V, dim=0)  # [B*V, context_len]
+                ctx_for_loss = ctx.repeat_interleave(V, dim=0)
             else:
                 ctx_for_loss = ctx.repeat_interleave(K_SAMPLES, dim=0)
             full_seq = torch.cat([ctx_for_loss, flat_G], dim=1)
@@ -695,7 +749,6 @@ def train_remote():
                 ref_dist = torch.distributions.Categorical(logits=ref_logits)
                 kl = torch.distributions.kl.kl_divergence(new_dist, ref_dist).mean()
                 
-                # Update KL coefficient
                 if ADAPTIVE_KL and kl_controller and accum_step == 0:
                     current_kl_coef = kl_controller.update(kl.item(), current_kl_coef)
                 else:
@@ -708,16 +761,14 @@ def train_remote():
             scaler.scale(loss).backward()
             total_loss += loss.item()
             
-            # Track metrics
             all_metrics["kl"].append(kl.item())
             all_metrics["entropy"].append(entropy.item())
             all_metrics["pol_loss"].append(pol_loss.item())
             all_metrics["ratio"].append(ratio.mean().item())
             all_metrics["ratio_max"].append(ratio.max().item())
         
-        # Optimizer step (potentially fused)
         scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(actor.parameters(), GRAD_CLIP)
+        grad_norm = torch.nn.utils.clip_grad_norm_(actor.parameters(), GRAD_CLIP)
         scaler.step(opt)
         scaler.update()
         
@@ -728,9 +779,7 @@ def train_remote():
             actor_old.load_state_dict(actor.state_dict())
             actor_old.eval()
         
-        # Logging (reference style + accuracy)
         if it % LOG_INTERVAL == 0:
-            # Aggregate rewards and advantages from all accumulation steps
             R_all = torch.cat(all_R, dim=0) if all_R else R
             adv_all = torch.cat(all_adv, dim=0) if all_adv else adv
             
@@ -749,10 +798,46 @@ def train_remote():
                 "entropy": all_metrics.get("entropy", [0])[-1] if all_metrics.get("entropy") else 0,
                 "pol_loss": all_metrics.get("pol_loss", [0])[-1] if all_metrics.get("pol_loss") else 0,
                 "total_loss": total_loss * GRAD_ACCUM,
-                "accuracy": np.mean(all_metrics.get("accuracy", [0])),  # Our addition
+                "accuracy": np.mean(all_metrics.get("accuracy", [0])),
+                "reward_variance": np.mean(all_metrics.get("reward_variance", [0])),
+                "reward_spread": np.mean(all_metrics.get("reward_spread", [0])),
+                "prob_change": np.mean(all_metrics.get("prob_change", [0])) if all_metrics.get("prob_change") else 0,
                 "chars": chars_seen,
                 "epoch": current_epoch,
             }, step=chars_seen)
+            
+            if USE_CONFIDENCE_SCALING and old_probs is not None:
+                correct_confidence = old_probs[torch.arange(MICRO_BATCH), ref_char].mean().item()
+                confidence_scale_avg = (1.0 + CONFIDENCE_WEIGHT * old_probs[torch.arange(MICRO_BATCH), ref_char].clamp(0, 1)).mean().item()
+                wandb.log({
+                    "confidence/mean": correct_confidence,
+                    "confidence/reward_boost": confidence_scale_avg - 1.0,
+                    "gradient/norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }, step=chars_seen)
+                
+                if confidence_monitor:
+                    avg_accuracy = np.mean(all_metrics.get("accuracy", [0]))
+                    confidence_monitor.update(correct_confidence, avg_accuracy, grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+                    
+                    is_calibrated, calibration_error = confidence_monitor.check_calibration()
+                    has_collapse, collapse_ratio = confidence_monitor.check_confidence_collapse()
+                    is_stable, grad_variance = confidence_monitor.check_gradient_stability()
+                    
+                    wandb.log({
+                        "monitoring/calibration_error": calibration_error,
+                        "monitoring/confidence_collapse_ratio": collapse_ratio,
+                        "monitoring/gradient_variance": grad_variance,
+                        "monitoring/is_calibrated": float(is_calibrated),
+                        "monitoring/has_collapse": float(has_collapse),
+                        "monitoring/is_stable": float(is_stable),
+                    }, step=chars_seen)
+                    
+                    if not is_calibrated:
+                        print(f"WARNING: Model miscalibrated! Error: {calibration_error:.3f}")
+                    if has_collapse:
+                        print(f"WARNING: Confidence collapse detected! Ratio: {collapse_ratio:.3f}")
+                    if not is_stable:
+                        print(f"WARNING: Gradient instability! Variance: {grad_variance:.3f}")
         
         # Generate samples periodically
         if it % SAMPLE_INTERVAL == 0:
@@ -810,7 +895,6 @@ def train_remote():
     
     run.finish()
 
-# ─── Local entry point ────────────────────────────────────────────────────
 @stub.local_entrypoint()
 def main():
     train_remote.remote()
