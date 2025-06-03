@@ -8,22 +8,26 @@ Simplified implementation focusing on:
 """
 
 # ─── hyper-params ────────────────────────────────────────────────────────
-CONTEXT_LEN = 32                  # Sliding window context
-HORIZON = 8                       # Characters to generate
-BATCH = 512                       # Large batch via accumulation
-MICRO_BATCH = 64                  # Moderate micro-batch 
+CONTEXT_LEN = 8                   # Sliding window context
+HORIZON = 1                       # Single character prediction for exhaustive exploration
+BATCH = 4096                      # Large batch via accumulation
+MICRO_BATCH = 512                 # Moderate micro-batch 
 GRAD_ACCUM = BATCH // MICRO_BATCH # 8 gradient accumulation steps
-TOTAL_ITERS = 500                 # Training iterations
+EPOCHS = 1                        # Number of epochs to train
+DATASET_SIZE = 1_115_394          # Exact size of TinyShakespeare in characters
+ITERS_PER_EPOCH = DATASET_SIZE // BATCH  # ~2,178 iterations per epoch
+TOTAL_ITERS = ITERS_PER_EPOCH * EPOCHS   # Total training iterations
 LR = 3e-5                         # Learning rate
 BETA_KL = 1e-3                    # KL divergence coefficient
 KL_WARM = 50_000                  # KL warmup tokens
 NEG_REWARD = False                # No negative rewards
 GPU_TYPE = "H100"                 
 CLIP_RATIO = 0.5                  # PPO clip ratio
-K_SAMPLES = 4                     # Samples per context
+K_SAMPLES = 65                    # We explore ALL 65 characters exhaustively
 ENTROPY_COEF = 0.01               # Entropy bonus coefficient
-TEMPERATURE = 1.2                 # Sampling temperature
-MIN_VARIANCE = 0.1                # Minimum advantage variance                
+TEMPERATURE = 1.2                 # Sampling temperature (not used in exhaustive)
+MIN_VARIANCE = 0.1                # Minimum advantage variance
+USE_EXHAUSTIVE = True             # Use exhaustive exploration                
 
 # Model architecture
 N_LAYER = 6                       
@@ -49,7 +53,6 @@ SAMPLE_INTERVAL = 20
 # Mixed precision
 USE_AMP = True                    
 AMP_DTYPE = "bfloat16"           
-# USE_FLASH_ATTN is set by the auto-configuration above            
 
 # ─── imports ─────────────────────────────────────────────────────────────
 import requests, torch, torch.nn as nn, torch.nn.functional as F
@@ -63,7 +66,7 @@ from typing import Dict, List, Tuple, Optional
 from torch.cuda.amp import autocast, GradScaler
 from functools import partial
 
-stub = modal.App("grpo-dense-v2-reference-logging")
+stub = modal.App("exhaustive-single-char-exploration-epoch1-batch-4096-microbatch512-v1")
 
 # Modal image with Flash Attention
 flash_attn_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
@@ -323,6 +326,14 @@ def build_bigram_counts(text, stoi):
         counts[(c1, c2)] += 1
     return counts
 
+def build_char_frequencies(text, stoi, V):
+    """Build character frequency distribution from Shakespeare text"""
+    char_counts = torch.zeros(V)
+    for char in text:
+        char_counts[stoi[char]] += 1
+    char_freq = char_counts / char_counts.sum()
+    return char_freq
+
 # ─── Temperature-based generation (from v2) ──────────────────────────────
 @torch.no_grad()
 def generate_with_temperature(model, contexts, horizon, K, temperature=1.0):
@@ -350,6 +361,29 @@ def generate_with_temperature(model, contexts, horizon, K, temperature=1.0):
     # Reshape to [B, K, horizon]
     generated = ctx[:, -horizon:].reshape(B, K, horizon)
     return generated
+
+# ─── Exhaustive single character generation ──────────────────────────────
+@torch.no_grad()
+def generate_exhaustive_single_char(model, contexts, V):
+    """
+    Generate ALL possible next characters (exhaustive exploration)
+    Returns both the characters and their log probabilities
+    """
+    B = contexts.shape[0]
+    device = contexts.device
+    
+    # Get model predictions for the contexts
+    ctx_window = contexts[:, -model.context_len:] if contexts.shape[1] > model.context_len else contexts
+    
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        logits = model(ctx_window)[:, -1, :]  # [B, V]
+    
+    log_probs = F.log_softmax(logits, dim=-1)  # [B, V]
+    
+    # Create all possible next characters
+    all_chars = torch.arange(V, device=device).unsqueeze(0).expand(B, -1)  # [B, V]
+    
+    return all_chars, log_probs
 
 # ─── Improved reward computation (from v2) ───────────────────────────────
 def compute_rewards(gen, ref, ref_logits):
@@ -390,6 +424,37 @@ def compute_rewards_batch(gen, ref, ref_logits):
     }
     
     return reward, exact_match, metrics
+
+def compute_exhaustive_rewards(all_chars, ref_char, ref_model, ctx, V):
+    """
+    Compute rewards for ALL possible next characters
+    all_chars: [B, V] - all possible characters for each batch
+    ref_char: [B] - the actual next character in Shakespeare
+    """
+    B = ctx.shape[0]
+    device = ctx.device
+    
+    # Prepare for reward computation
+    rewards = torch.zeros(B, V, device=device)
+    
+    # Exact match reward - only the correct character gets this
+    for b in range(B):
+        rewards[b, ref_char[b]] = 2.0  # Exact match bonus
+    
+    # Get reference model's distribution
+    with torch.no_grad():
+        ref_logits = ref_model(ctx)[:, -1, :]  # [B, V]
+        ref_probs = F.softmax(ref_logits, dim=-1)  # [B, V]
+        
+    # Partial credit based on reference probability
+    # Every character gets partial credit based on how likely it is
+    partial_rewards = torch.log(ref_probs + 1e-10) / 10.0
+    rewards += 0.1 * partial_rewards
+    
+    # Character frequency reward (if we have computed it)
+    # This encourages matching Shakespeare's character distribution
+    
+    return rewards
 
 def compute_entropy(logits):
     """Compute entropy to measure model uncertainty"""
@@ -451,6 +516,8 @@ def train_remote():
     print(f"Batch size: {BATCH} (micro-batch: {MICRO_BATCH}, grad accum: {GRAD_ACCUM})")
     print(f"Model size: {N_LAYER} layers, {N_EMB} embedding dim, {N_HEAD} heads")
     print(f"Using Flash Attention: {USE_FLASH_ATTN}")
+    print(f"Using Exhaustive Exploration: {USE_EXHAUSTIVE} (exploring all {V} characters)")
+    print(f"Training for {EPOCHS} epochs ({TOTAL_ITERS:,} iterations, {ITERS_PER_EPOCH:,} iters/epoch)")
     
     # Initialize models
     bigram_counts = build_bigram_counts(text, stoi)
@@ -477,7 +544,8 @@ def train_remote():
     
     # Initialize wandb
     run = wandb.init(
-        project="gpt2-grpo-v2",
+        project="avataRL",
+        name="exhaustive-single-char-exploration-epoch1-batch-4096-microbatch512-v1-h100",
         config={
             "model": {
                 "vocab_size": V,
@@ -495,6 +563,8 @@ def train_remote():
                 "grad_accum_steps": GRAD_ACCUM,
                 "learning_rate": LR,
                 "k_samples": K_SAMPLES,
+                "exhaustive_exploration": USE_EXHAUSTIVE,
+                "exploration_method": "exhaustive_all_chars" if USE_EXHAUSTIVE else "sampling",
             },
             "optimizations": {
                 "flash_attention": USE_FLASH_ATTN,
@@ -524,42 +594,75 @@ def train_remote():
             # Load data
             ctx, ref_tok = loader.next()
             
-            # Generate samples with temperature-based sampling
-            with torch.no_grad():
-                G = generate_with_temperature(actor_old, ctx, HORIZON, K_SAMPLES, temperature=TEMPERATURE)
-            
-            # Calculate rewards
-            R = torch.zeros_like(G, dtype=torch.float32)
-            
-            for k in range(K_SAMPLES):
-                gen = G[:, k, :]
-                
+            if USE_EXHAUSTIVE and HORIZON == 1:
+                # Exhaustive exploration: try ALL 65 characters
                 with torch.no_grad():
-                    full_seq = torch.cat([ctx, gen], dim=1)
-                    ref_logits = ref(full_seq[:, -HORIZON-1:])[:, -HORIZON:]
+                    all_chars, old_log_probs = generate_exhaustive_single_char(actor_old, ctx, V)
+                    
+                # Compute rewards for ALL characters
+                ref_char = ref_tok[:, 0]  # First character is what we're predicting
+                R = compute_exhaustive_rewards(all_chars, ref_char, ref, ctx, V)  # [B, V]
                 
-                reward, accuracy, reward_metrics = compute_rewards_batch(gen, ref_tok, ref_logits)
-                R[:, k, :] = reward
+                # Calculate accuracy (how often model's top choice matches reference)
+                top_choice = old_log_probs.argmax(dim=-1)  # [B]
+                accuracy = (top_choice == ref_char).float().mean().item()
+                all_metrics["accuracy"].append(accuracy)
                 
-                for key, val in reward_metrics.items():
-                    all_metrics[key].append(val)
-            
-            # Compute advantages
-            base = R.mean(dim=1, keepdim=True)
-            adv = R - base
-            adv_std = torch.maximum(adv.std(dim=1, keepdim=True), torch.tensor(MIN_VARIANCE, device=DEV))
-            adv = adv / adv_std
-            
-            # Store for logging
-            all_R.append(R)
-            all_adv.append(adv)
-            
-            # Flatten
-            flat_G = G.reshape(-1, HORIZON)
-            flat_adv = adv.reshape(-1, HORIZON)
+                # Compute advantages across all V characters
+                base = R.mean(dim=1, keepdim=True)  # [B, 1]
+                adv = R - base  # [B, V]
+                adv_std = torch.maximum(adv.std(dim=1, keepdim=True), torch.tensor(MIN_VARIANCE, device=DEV))
+                adv = adv / adv_std
+                
+                # Store for logging
+                all_R.append(R.unsqueeze(2))  # Add time dimension for compatibility
+                all_adv.append(adv.unsqueeze(2))
+                
+                # Prepare for loss computation
+                flat_G = all_chars.reshape(-1, 1)  # [B*V, 1]
+                flat_adv = adv.reshape(-1, 1)  # [B*V, 1]
+                
+            else:
+                # Original sampling-based generation
+                with torch.no_grad():
+                    G = generate_with_temperature(actor_old, ctx, HORIZON, K_SAMPLES, temperature=TEMPERATURE)
+                
+                # Calculate rewards
+                R = torch.zeros_like(G, dtype=torch.float32)
+                
+                for k in range(K_SAMPLES):
+                    gen = G[:, k, :]
+                    
+                    with torch.no_grad():
+                        full_seq = torch.cat([ctx, gen], dim=1)
+                        ref_logits = ref(full_seq[:, -HORIZON-1:])[:, -HORIZON:]
+                    
+                    reward, accuracy, reward_metrics = compute_rewards_batch(gen, ref_tok, ref_logits)
+                    R[:, k, :] = reward
+                    
+                    for key, val in reward_metrics.items():
+                        all_metrics[key].append(val)
+                
+                # Compute advantages
+                base = R.mean(dim=1, keepdim=True)
+                adv = R - base
+                adv_std = torch.maximum(adv.std(dim=1, keepdim=True), torch.tensor(MIN_VARIANCE, device=DEV))
+                adv = adv / adv_std
+                
+                # Store for logging
+                all_R.append(R)
+                all_adv.append(adv)
+                
+                # Flatten
+                flat_G = G.reshape(-1, HORIZON)
+                flat_adv = adv.reshape(-1, HORIZON)
             
             # Forward pass
-            ctx_for_loss = ctx.repeat_interleave(K_SAMPLES, dim=0)
+            if USE_EXHAUSTIVE and HORIZON == 1:
+                # For exhaustive, we need to expand context V times, not K_SAMPLES times
+                ctx_for_loss = ctx.repeat_interleave(V, dim=0)  # [B*V, context_len]
+            else:
+                ctx_for_loss = ctx.repeat_interleave(K_SAMPLES, dim=0)
             full_seq = torch.cat([ctx_for_loss, flat_G], dim=1)
             
             with torch.amp.autocast('cuda',dtype = torch.bfloat16):
@@ -631,6 +734,8 @@ def train_remote():
             R_all = torch.cat(all_R, dim=0) if all_R else R
             adv_all = torch.cat(all_adv, dim=0) if all_adv else adv
             
+            current_epoch = it / ITERS_PER_EPOCH
+            
             wandb.log({
                 "reward": R_all.mean().item(),
                 "reward_max": R_all.max().item(),
@@ -646,6 +751,7 @@ def train_remote():
                 "total_loss": total_loss * GRAD_ACCUM,
                 "accuracy": np.mean(all_metrics.get("accuracy", [0])),  # Our addition
                 "chars": chars_seen,
+                "epoch": current_epoch,
             }, step=chars_seen)
         
         # Generate samples periodically
