@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """
-Parallel n-gram precomputation using multiprocessing and Numba
-Combines:
-- Numba JIT compilation for C-like speed
-- Multiprocessing to compute different n-grams in parallel
-- Memory mapping for efficient data sharing
+parallel n-gram precomputation using multiprocessing and numba
+combines:
+- numba jit compilation for c-like speed
+- multiprocessing to compute different n-grams in parallel
+- memory mapping for efficient data sharing
 """
 
 import requests
