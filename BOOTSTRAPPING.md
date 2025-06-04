@@ -24,12 +24,13 @@ so our success depends on these factors: smallest unit of memorization that rand
 
 ## language modelling is a game
 we can define languuage modelling as a game,
-    - where the context is the current state
-    - the predicted char is the action
-    - the reward is a value assigned based on the accuracy of the predicted token
-    - the two players are the model competing with itself - in parallel and with its past checkpoints.
+- where the context is the current state
+- the predicted char is the action
+- the reward is a value assigned based on the accuracy of the predicted token
+- the two players are the model competing with itself - in parallel and with its past checkpoints.
 
 to simplify my experiments, i focus on smaller models and shorter sequences to reduce computational complexity and isolate key behaviors.
+
 as i develop confidence over things i want to scale, i increase the model size and try bolder targets.
 
 ## initialization
@@ -77,7 +78,7 @@ to start as baseline, in each iteration we grab a batch of 8-char context window
 
 reference is a key aspect of the design, ensuring that the model effectively utilizes past predictions to inform future actions. 
 
-even if i reduced the sample space to 65 characters i can't 
+even if i reduced the sample space to 65 characters i can't really expect to visit over all of them per iteration so i deploy some tricks as i share here.
 
 ## eval
 for eval, we calculate perplexity and accuracy to assess model performance.
