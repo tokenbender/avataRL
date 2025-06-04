@@ -1,4 +1,4 @@
-# avataRL
+# avatarl
 
 training a tinyshakespeare model -> zero pretrain, all rl baby.
 
@@ -71,15 +71,15 @@ monolith hackable script for modal deployment, just install modal via pip
 
 
 ## progress
-**28May25**] so since here i am starting with random weights, i wished to find a way to bootstrap this. and for rl, i am starting with grpo algo. 
+**28may25**] so since here i am starting with random weights, i wished to find a way to bootstrap this. and for rl, i am starting with grpo algo. 
 
-**29May25** i was able to get positive rewards, the approach i tried was to have a bigram objective for partial scoring of predictions and groundtruth, i am getting positive rewards and after like 80% of the run, it is matching bigram level performance and then drops off. see [wandb runs](https://wandb.ai/ahm-rimer/gpt2-grpo-v2/reports/avataRL-runs--VmlldzoxMzAzOTU3Mw) for detailed metrics.
+**29may25** i was able to get positive rewards, the approach i tried was to have a bigram objective for partial scoring of predictions and groundtruth, i am getting positive rewards and after like 80% of the run, it is matching bigram level performance and then drops off. see [wandb runs](https://wandb.ai/ahm-rimer/gpt2-grpo-v2/reports/avatarl-runs--vmlldzoxmzazotu3mw) for detailed metrics.
 
-**30May25** So i figured i could ramp up the ngrams. trigram after bigram and so on, but this approach is going to scale badly. so i decided to think deeper on this. since i need to run many experiments with limited personal budget, i improved speed from 27-30min previously to 2min50s current. now i can do 10x more experiments and it is a good base.
+**30may25** so i figured i could ramp up the ngrams. trigram after bigram and so on, but this approach is going to scale badly. so i decided to think deeper on this. since i need to run many experiments with limited personal budget, i improved speed from 27-30min previously to 2min50s current. now i can do 10x more experiments and it is a good base.
 
-**current** thinking of how to boostrap with sparse rewards to match pretrain level performance. would create a thinking md file.
+**03june25** shared insights on the progress made in bootstrapping a random weights system with rl pretrain in BOOTSTRAPPING md file.
 
-all the progress and ideas are documented in the THINKING.md file for reference.
+**current** bridge the gap between bootstrapped level of performance and groundtruth accuracy.
 
 
 ## contributing
@@ -95,12 +95,12 @@ this project is licensed under the apache 2.0 license - see the [license](licens
 if you find this work useful in your research, please consider citing:
 
 ```bibtex
-@software{avatarL2025,
+@software{avatarl2025,
   author = {tokenbender},
-  title = {avataRL: Training Language Models from Scratch with Pure Reinforcement Learning},
+  title = {avatarl: training language models from scratch with pure reinforcement learning},
   year = {2025},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  url = {https://github.com/tokenbender/avataRL}
+  publisher = {github},
+  journal = {github repository},
+  url = {https://github.com/tokenbender/avatarl}
 }
 ```
