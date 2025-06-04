@@ -16,7 +16,7 @@ it may seem like you can just use next token prediction as reference, but sparse
 
 behold the most randomness you have seen in an RL experiment probably.
 
-if you are coming from a background without much information on rl, it would be hard to follow so i share a simple primer on rl here - rl-guide-part1.md
+if you are coming from a background without much information on rl, it would be hard to follow so i share nathan lambert's rl primer here - https://rlhfbook.com/
 
 rl algorithms are designed to let the system grow like weed, while our rewards guide and shape the growth towards the patterns we desire, ensuring alignment with the intended objectives.
 
