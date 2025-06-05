@@ -1,57 +1,61 @@
 #!/usr/bin/env python
 
-# Hyperparameters
-CONTEXT_LEN = 8                   # Sliding window context
-HORIZON = 1                       # Single character prediction for exhaustive exploration
-BATCH = 4096                      # Large batch via accumulation
-MICRO_BATCH = 512                 # Moderate micro-batch 
-GRAD_ACCUM = BATCH // MICRO_BATCH # 8 gradient accumulation steps
-EPOCHS = 3                        # Number of epochs to train
-DATASET_SIZE = 1_115_394          # Exact size of TinyShakespeare in characters
-ITERS_PER_EPOCH = DATASET_SIZE // BATCH  # ~2,178 iterations per epoch
-TOTAL_ITERS = ITERS_PER_EPOCH * EPOCHS   # Total training iterations
-LR = 3e-5                         # Learning rate
-BETA_KL = 1e-3                    # KL divergence coefficient
-KL_WARM = 50_000                  # KL warmup tokens
-NEG_REWARD = False                # No negative rewards
-GPU_TYPE = "H100"                 
-CLIP_RATIO = 0.5                  # PPO clip ratio
-K_SAMPLES = 65                    # We explore ALL 65 characters exhaustively
-ENTROPY_COEF = 0.08               # Entropy bonus coefficient
-TEMPERATURE = 1.2                 # Sampling temperature (not used in exhaustive)
-MIN_VARIANCE = 0.1                # Minimum advantage variance
-USE_EXHAUSTIVE = True             # Use exhaustive exploration
-USE_CONFIDENCE_SCALING = True     # Enable confidence scaling rewards
-CONFIDENCE_WEIGHT = 0.5           # Conservative confidence scaling weight
-CONFIDENCE_CLIP = 2.0             # Maximum confidence scaling factor
-ENABLE_CONFIDENCE_PENALTY = False # Phase 2: Enable penalties for overconfident wrong predictions
+# Project and experiment configuration
+PROJECT_NAME = "avataRL-cleanlogs_and_evals"
+EXPERIMENT_NAME = "iter8-ngramsfixed-a100"  # Updated to reflect n-gram usage
 
-# Model architecture
-N_LAYER = 6                       
-N_HEAD = 8                        
-N_EMB = 512                       # Wider for better GPU util
+CONTEXT_LEN = 8
+HORIZON = 1
+BATCH = 16384
+MICRO_BATCH = 512
+GRAD_ACCUM = BATCH // MICRO_BATCH
+EPOCHS = 3
+DATASET_SIZE = 1_115_394
+ITERS_PER_EPOCH = DATASET_SIZE // BATCH
+TOTAL_ITERS = int(ITERS_PER_EPOCH * EPOCHS)
+LR = 3e-5
+BETA_KL = 1e-3
+KL_WARM = 50_000
+NEG_REWARD = False
+GPU_TYPE = "H100"
+CLIP_RATIO = 0.5
+K_SAMPLES = 65
+ENTROPY_COEF = 0.1
+TEMPERATURE = 1.2
+MIN_VARIANCE = 0.1
+USE_EXHAUSTIVE = True
+USE_CONFIDENCE_SCALING = True
+CONFIDENCE_WEIGHT = 0.5
+CONFIDENCE_CLIP = 4.0
+ENABLE_CONFIDENCE_PENALTY = True
 
-# Optimization settings
-USE_FLASH_ATTN = True             # Keep Flash Attention
-USE_TORCH_COMPILE = False         # Disable torch.compile to avoid conflicts
-USE_CHUNKED_LOSS = False          # Use standard loss computation
-PACKED_DATASET = False            # Use standard data loading
-USE_8BIT_OPTIMIZER = False        # Use standard AdamW
-NUM_CUDA_STREAMS = 1              # Single stream for simplicity
+# N-gram configuration
+USE_PRECOMPUTED_NGRAMS = True
+USE_HIERARCHICAL_NGRAMS = True
+USE_NGRAM_CURRICULUM = True
+NGRAM_CACHE_DIR = "./ngram_cache"
 
-# Advanced settings
-ADAPTIVE_KL = True                
-KL_TARGET = 0.02                  
-GRAD_CLIP = 1.0                   
-LOG_INTERVAL = 5                  
-EVAL_INTERVAL = 20                
-SAMPLE_INTERVAL = 20              
+N_LAYER = 4
+N_HEAD = 4
+N_EMB = 128
 
-# Mixed precision
-USE_AMP = True                    
+USE_FLASH_ATTN = True
+USE_TORCH_COMPILE = False
+USE_CHUNKED_LOSS = False
+PACKED_DATASET = False
+USE_8BIT_OPTIMIZER = False
+NUM_CUDA_STREAMS = 1
+
+ADAPTIVE_KL = True
+KL_TARGET = 0.02
+GRAD_CLIP = 1.0
+LOG_INTERVAL = 5
+EVAL_INTERVAL = int(ITERS_PER_EPOCH * 0.1)  # Every 0.1 epoch
+SAMPLE_INTERVAL = int(ITERS_PER_EPOCH * 0.1)  # Every 0.1 epoch              
+
+USE_AMP = True
 AMP_DTYPE = "bfloat16"           
 
-# Imports
 import requests, torch, torch.nn as nn, torch.nn.functional as F
 from pathlib import Path
 from tqdm import tqdm
@@ -64,22 +68,31 @@ from torch.cuda.amp import autocast, GradScaler
 from functools import partial
 import warnings
 
-stub = modal.App("exhaustive-confidence-scaling-v2-h200-phase1")
+# Import n-gram modules
+from ngram_loader import NGramArtifactLoader, LazyNGramLoader
+from ngram_models import (
+    PrecomputedBigramRef, PrecomputedTrigramRef, PrecomputedFourgramRef,
+    HierarchicalNGramRef, AdaptiveNGramRef, NGramCurriculum
+)
+from ngram_rewards import compute_hierarchical_ngram_rewards
 
-# Modal image with Flash Attention
-flash_attn_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+stub = modal.App(f"{PROJECT_NAME}-{EXPERIMENT_NAME}")
+
+flash_attn_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("numpy", "torch==2.5.0", "tqdm", "wandb", "requests", "matplotlib", "nvidia-ml-py3")
+    .pip_install("numpy", "torch==2.5.0", "tqdm", "wandb", "requests", "matplotlib", "nvidia-ml-py3", "huggingface_hub")
     .pip_install(flash_attn_wheel)
+    .copy_local_file("ngram_loader.py", "/root/ngram_loader.py")
+    .copy_local_file("ngram_models.py", "/root/ngram_models.py")
+    .copy_local_file("ngram_rewards.py", "/root/ngram_rewards.py")
 )
 
 DATA_URL = ("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/"
             "tinyshakespeare/input.txt")
 
 
-# RoPE Helper functions
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x[..., ::2], x[..., 1::2]
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
@@ -90,7 +103,7 @@ class RotaryCache(nn.Module):
         super().__init__()
         inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2) / head_dim))
         t = torch.arange(max_len)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)  # (max_len, d/2)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
         sin, cos = freqs.sin(), freqs.cos()
         self.register_buffer("sin_base", sin, persistent=False)
         self.register_buffer("cos_base", cos, persistent=False)
@@ -107,10 +120,9 @@ class ContextualTextLoader:
         self.data = enc(text)
         self.B, self.T, self.context_len = B, T, context_len
         self.device = device
-        self.pos = context_len  # Start after we have enough context
+        self.pos = context_len
         
     def next(self):
-        # Ensure we have enough context
         if self.pos + self.B*self.T + 1 > len(self.data):
             self.pos = self.context_len
             
@@ -118,7 +130,6 @@ class ContextualTextLoader:
         targets = []
         
         for b in range(self.B):
-            # Get context window using sliding approach
             ctx_start = self.pos - self.context_len + b*self.T
             ctx_end = self.pos + b*self.T
             
@@ -141,13 +152,11 @@ class OptimizedAttention(nn.Module):
         self.n_emb = n_emb
         self.head_dim = n_emb // n_head
         
-        # Fused QKV projection for efficiency
         self.qkv = nn.Linear(n_emb, 3 * n_emb, bias=False)
         self.o_proj = nn.Linear(n_emb, n_emb, bias=False)
         self.dropout = nn.Dropout(dropout)
         max_seq = CONTEXT_LEN + HORIZON
         self.rope = RotaryCache(self.head_dim, max_seq)
-        # Try to use Flash Attention
         self.use_flash_attn = False
         if USE_FLASH_ATTN:
             try:
@@ -161,27 +170,25 @@ class OptimizedAttention(nn.Module):
     def forward(self, x, mask=None):
         B, T, C = x.shape
         
-        # Compute QKV in one go
         qkv = self.qkv(x).reshape(B, T, 3, self.n_head, self.head_dim)
         
-        q, k, v = qkv.unbind(dim=2)  # each (B, T, h, d)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B, h, T, d)
+        q, k, v = qkv.unbind(dim=2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
         sin, cos = self.rope(T)
         q, k = (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
         q, k = norm(q), norm(k)
 
         if self.use_flash_attn:
-            packed = torch.stack((q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)), dim=2)  # (B, T, 3, h, d)
+            packed = torch.stack((q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)), dim=2)
             dtype0 = packed.dtype
             if dtype0 not in (torch.float16, torch.bfloat16):
                 packed = packed.to(torch.bfloat16)
-            out = self.flash_attn_func(packed, causal=True, dropout_p=0.1 if self.training else 0.0)  # (B, T, h, d)
+            out = self.flash_attn_func(packed, causal=True, dropout_p=0.1 if self.training else 0.0)
             out = out.to(dtype0).reshape(B, T, C)
         else:
-            # Standard attention with memory-efficient implementation
             q, k, v = qkv.unbind(dim=2)
-            q = q.transpose(1, 2)  # (B, n_head, T, head_dim)
+            q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
             
@@ -193,7 +200,6 @@ class OptimizedAttention(nn.Module):
 
 def norm(x):
     """RMSNorm implementation - compatible with PyTorch 2.3"""
-    # RMS normalization: x / sqrt(mean(x^2) + eps)
     return F.rms_norm(x, (x.size(-1),))
 
 
@@ -202,16 +208,14 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attn = OptimizedAttention(n_emb, n_head, dropout)
         
-        # Fused FFN operations
         self.ffn = nn.Sequential(
             nn.Linear(n_emb, 4 * n_emb, bias=False),
-            nn.GELU(approximate='tanh'),  # Faster GELU approximation
+            nn.GELU(approximate='tanh'),
             nn.Linear(4 * n_emb, n_emb, bias=False),
             nn.Dropout(dropout)
         )
         
     def forward(self, x, mask=None):
-        # Pre-norm architecture with RMSNorm
         x = x + self.attn(norm(x), mask)
         x = x + self.ffn(norm(x))
         return x
@@ -223,24 +227,19 @@ class GPT(nn.Module):
         self.context_len = context_len
         self.n_layer = n_layer
         
-        # Embeddings
         self.wte = nn.Embedding(V, n_emb)
-        # self.wpe = nn.Embedding(context_len + HORIZON, n_emb)
         self.drop = nn.Dropout(0.1)
         
-        # Transformer blocks
         self.layers = nn.ModuleList([
             TransformerBlock(n_emb, n_head, dropout=0.1)
             for _ in range(n_layer)
         ])
         
         self.head = nn.Linear(n_emb, V, bias=False)
-        self.head.weight = self.wte.weight  # Weight tying
+        self.head.weight = self.wte.weight
         
-        # Initialize weights
         self.apply(self._init_weights)
         
-        # Pre-compute causal mask on correct device
         self.register_buffer("causal_mask", torch.triu(
             torch.ones(context_len + HORIZON, context_len + HORIZON), diagonal=1
         ).bool())
@@ -256,20 +255,16 @@ class GPT(nn.Module):
     def forward(self, idx, use_cache=False):
         B, T = idx.shape
         
-        
-        # Embeddings
         tok_emb = self.wte(idx)
         
         x = self.drop(tok_emb)
         
-        # Get mask
         mask = self.causal_mask[:T, :T]
         
-        # Forward through layers
         for layer in self.layers:
             x = layer(x, mask)
         
-        x = norm(x)  # RMSNorm instead of LayerNorm
+        x = norm(x)
         logits = self.head(x)
         
         return logits
@@ -335,10 +330,8 @@ def generate_with_temperature(model, contexts, horizon, K, temperature=1.0):
     B = contexts.shape[0]
     device = contexts.device
     
-    # Expand contexts for K samples
-    ctx = contexts.repeat_interleave(K, dim=0)  # [B*K, context_len]
+    ctx = contexts.repeat_interleave(K, dim=0)
     
-    # Generate with temperature
     for _ in range(horizon):
         ctx_window = ctx[:, -model.context_len:] if ctx.shape[1] > model.context_len else ctx
         
@@ -349,7 +342,6 @@ def generate_with_temperature(model, contexts, horizon, K, temperature=1.0):
         next_char = torch.multinomial(probs, 1)
         ctx = torch.cat([ctx, next_char], dim=1)
     
-    # Reshape to [B, K, horizon]
     generated = ctx[:, -horizon:].reshape(B, K, horizon)
     return generated
 
@@ -362,33 +354,26 @@ def generate_exhaustive_single_char(model, contexts, V):
     B = contexts.shape[0]
     device = contexts.device
     
-    # Get model predictions for the contexts
     ctx_window = contexts[:, -model.context_len:] if contexts.shape[1] > model.context_len else contexts
     
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        logits = model(ctx_window)[:, -1, :]  # [B, V]
+        logits = model(ctx_window)[:, -1, :]
     
-    log_probs = F.log_softmax(logits, dim=-1)  # [B, V]
+    log_probs = F.log_softmax(logits, dim=-1)
     
-    # Create all possible next characters
-    all_chars = torch.arange(V, device=device).unsqueeze(0).expand(B, -1)  # [B, V]
+    all_chars = torch.arange(V, device=device).unsqueeze(0).expand(B, -1)
     
     return all_chars, log_probs
 
 def compute_rewards(gen, ref, ref_logits):
-    # Exact match reward (scaled up)
     exact_match = (gen == ref).float()
     
-    # Partial credit based on reference probability
     with torch.no_grad():
         ref_probs = F.softmax(ref_logits, dim=-1)
-        # Get probability of generated token under reference
         B, T = gen.shape
         gen_probs = ref_probs.gather(2, gen.unsqueeze(-1)).squeeze(-1)
-        # Log probability as partial reward
-        partial_reward = torch.log(gen_probs + 1e-10) / 10.0  # Scale down
+        partial_reward = torch.log(gen_probs + 1e-10) / 10.0
     
-    # Combined reward
     reward = exact_match + 0.1 * partial_reward
     
     return reward
@@ -414,40 +399,32 @@ def compute_exhaustive_rewards(all_chars, ref_char, ref_model, ctx, V, model_log
     B = ctx.shape[0]
     device = ctx.device
     
-    # Get reference model's distribution
     with torch.no_grad():
-        ref_logits = ref_model(ctx)[:, -1, :]  # [B, V]
-        ref_log_probs = F.log_softmax(ref_logits, dim=-1)  # [B, V]
+        ref_logits = ref_model(ctx)[:, -1, :]
+        ref_log_probs = F.log_softmax(ref_logits, dim=-1)
         
-    # Base reward: negative log probability under reference model
-    base_rewards = -ref_log_probs  # [B, V]
+    base_rewards = -ref_log_probs
     
-    # Scale rewards to increase variance (3x through scaling factor)
     VARIANCE_SCALE = 3.0
     base_rewards = base_rewards * VARIANCE_SCALE
     
-    # Model improvement bonus
     if model_log_probs is not None:
         improvement = model_log_probs - ref_log_probs
         improvement_bonus = torch.clamp(improvement, min=-1.0, max=2.0)
         base_rewards = base_rewards + improvement_bonus
     
-    # Exact match bonus
     exact_match_bonus = torch.zeros_like(base_rewards)
     for b in range(B):
         exact_match_bonus[b, ref_char[b]] = 5.0 * VARIANCE_SCALE
     
-    # Combine all rewards
     rewards = base_rewards + exact_match_bonus
     
-    # Confidence scaling
     if USE_CONFIDENCE_SCALING and old_probs is not None:
         confidence = old_probs[torch.arange(B), ref_char]
         confidence_scale = 1.0 + CONFIDENCE_WEIGHT * confidence.clamp(0, 1)
         confidence_scale = confidence_scale.clamp(1.0, CONFIDENCE_CLIP)
         rewards[torch.arange(B), ref_char] *= confidence_scale
         
-        # Phase 2: Penalize overconfident wrong predictions
         if ENABLE_CONFIDENCE_PENALTY:
             top_k = min(10, V)
             top_probs, top_indices = old_probs.topk(top_k, dim=-1)
@@ -457,7 +434,6 @@ def compute_exhaustive_rewards(all_chars, ref_char, ref_model, ctx, V, model_log
             penalties = -0.1 * top_probs * penalty_mask.float()
             rewards.scatter_add_(1, top_indices, penalties)
     
-    # Normalize rewards to have zero mean per batch
     rewards = rewards - rewards.mean(dim=1, keepdim=True)
     
     return rewards
@@ -548,12 +524,11 @@ class ConfidenceMonitor:
     secrets=[modal.Secret.from_name("wandb")]
 )
 def train_remote():
-    # Set all optimizations
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
-    torch.cuda.set_per_process_memory_fraction(0.95)  # Use more GPU memory
+    torch.cuda.set_per_process_memory_fraction(0.95)
     
     DEV = "cuda"
     ensure_dataset()
@@ -566,38 +541,55 @@ def train_remote():
     print(f"Model size: {N_LAYER} layers, {N_EMB} embedding dim, {N_HEAD} heads")
     print(f"Using Flash Attention: {USE_FLASH_ATTN}")
     print(f"Using Exhaustive Exploration: {USE_EXHAUSTIVE} (exploring all {V} characters)")
+    print(f"Using Precomputed N-grams: {USE_PRECOMPUTED_NGRAMS}")
     print(f"Training for {EPOCHS} epochs ({TOTAL_ITERS:,} iterations, {ITERS_PER_EPOCH:,} iters/epoch)")
     
-    # Initialize models
-    bigram_counts = build_bigram_counts(text, stoi)
-    ref = BigramRef(bigram_counts, V).to(DEV).eval()
+    # Initialize n-gram models
+    if USE_PRECOMPUTED_NGRAMS:
+        print("Loading precomputed n-gram scores from HuggingFace...")
+        ngram_loader = NGramArtifactLoader(cache_dir=NGRAM_CACHE_DIR)
+        
+        # Load n-gram scores
+        bigram_scores = ngram_loader.load_bigram_scores().to(DEV)
+        trigram_scores = ngram_loader.load_trigram_scores().to(DEV)
+        fourgram_scores = ngram_loader.load_fourgram_scores().to(DEV)
+        
+        print(f"Loaded n-gram scores - Bigram: {bigram_scores.shape}, Trigram: {trigram_scores.shape}, 4-gram: {fourgram_scores.shape}")
+        
+        if USE_HIERARCHICAL_NGRAMS:
+            ref = HierarchicalNGramRef(bigram_scores, trigram_scores, fourgram_scores, V).to(DEV).eval()
+            print("Using hierarchical n-gram reference model")
+        else:
+            ref = PrecomputedBigramRef(bigram_scores, V).to(DEV).eval()
+            print("Using precomputed bigram reference model")
+            
+        # Initialize curriculum if enabled
+        ngram_curriculum = NGramCurriculum(TOTAL_ITERS) if USE_NGRAM_CURRICULUM else None
+    else:
+        # Fallback to old method
+        bigram_counts = build_bigram_counts(text, stoi)
+        ref = BigramRef(bigram_counts, V).to(DEV).eval()
     
     actor = GPT(V).to(DEV)
     actor_old = GPT(V).to(DEV)
     actor_old.load_state_dict(actor.state_dict())
     actor_old.eval()
     
-    # Count parameters
     param_count = sum(p.numel() for p in actor.parameters())
     print(f"Total parameters: {param_count:,}")
     
-    # Standard optimizer
     opt = torch.optim.AdamW(actor.parameters(), lr=LR, weight_decay=0.01, betas=(0.9, 0.95))
     
-    # Mixed precision
     scaler = GradScaler(enabled=USE_AMP)
     
-    # Data loader
     loader = ContextualTextLoader(text, ENC, MICRO_BATCH, HORIZON, CONTEXT_LEN, device=DEV)
     kl_controller = AdaptiveKLController(KL_TARGET) if ADAPTIVE_KL else None
     
-    # Initialize confidence monitor
     confidence_monitor = ConfidenceMonitor() if USE_CONFIDENCE_SCALING else None
     
-    # Initialize wandb
     run = wandb.init(
-        project="avataRL",
-        name="exhaustive-confidence-scaling-phase1-v2-h200",
+        project=PROJECT_NAME,
+        name=EXPERIMENT_NAME,
         config={
             "model": {
                 "vocab_size": V,
@@ -621,6 +613,9 @@ def train_remote():
                 "confidence_weight": CONFIDENCE_WEIGHT,
                 "confidence_clip": CONFIDENCE_CLIP,
                 "confidence_penalty_enabled": ENABLE_CONFIDENCE_PENALTY,
+                "use_precomputed_ngrams": USE_PRECOMPUTED_NGRAMS,
+                "use_hierarchical_ngrams": USE_HIERARCHICAL_NGRAMS,
+                "use_ngram_curriculum": USE_NGRAM_CURRICULUM,
             },
             "optimizations": {
                 "flash_attention": USE_FLASH_ATTN,
@@ -630,24 +625,30 @@ def train_remote():
         }
     )
     
-    # Single stream for simplicity
     stream = torch.cuda.Stream()
     
     chars_seen = 0
     current_kl_coef = BETA_KL
     
-    # Training loop
     for it in tqdm(range(1, TOTAL_ITERS+1), desc="Training"):
         actor.train()
         opt.zero_grad(set_to_none=True)
         
         total_loss = 0.0
         all_metrics = defaultdict(list)
-        all_R = []  # Store rewards for logging
-        all_adv = []  # Store advantages for logging
+        
+        # Update n-gram curriculum weights if enabled
+        if USE_PRECOMPUTED_NGRAMS and USE_NGRAM_CURRICULUM and ngram_curriculum:
+            current_weights = ngram_curriculum.get_weights(it)
+            if hasattr(ref, 'weights'):
+                ref.weights.data = current_weights.to(DEV)
+            all_metrics["ngram_weights_bigram"].append(current_weights[0].item())
+            all_metrics["ngram_weights_trigram"].append(current_weights[1].item())
+            all_metrics["ngram_weights_fourgram"].append(current_weights[2].item())
+        all_R = []
+        all_adv = []
         
         for accum_step in range(GRAD_ACCUM):
-            # Load data
             ctx, ref_tok = loader.next()
             
             if USE_EXHAUSTIVE and HORIZON == 1:
@@ -656,9 +657,26 @@ def train_remote():
                     
                 ref_char = ref_tok[:, 0]
                 old_probs = torch.exp(old_log_probs) if USE_CONFIDENCE_SCALING else None
-                R = compute_exhaustive_rewards(all_chars, ref_char, ref, ctx, V, 
-                                             model_log_probs=old_log_probs,
-                                             old_probs=old_probs)
+                
+                # Use hierarchical n-gram rewards if enabled
+                if USE_PRECOMPUTED_NGRAMS and USE_HIERARCHICAL_NGRAMS and isinstance(ref, HierarchicalNGramRef):
+                    confidence_config = {
+                        'weight': CONFIDENCE_WEIGHT,
+                        'clip': CONFIDENCE_CLIP,
+                        'enable_penalty': ENABLE_CONFIDENCE_PENALTY
+                    } if USE_CONFIDENCE_SCALING else None
+                    
+                    R = compute_hierarchical_ngram_rewards(
+                        all_chars, ref_char, ref, ctx, V,
+                        model_log_probs=old_log_probs,
+                        old_probs=old_probs,
+                        confidence_config=confidence_config
+                    )
+                else:
+                    # Fallback to original reward computation
+                    R = compute_exhaustive_rewards(all_chars, ref_char, ref, ctx, V, 
+                                                 model_log_probs=old_log_probs,
+                                                 old_probs=old_probs)
                 
                 top_choice = old_log_probs.argmax(dim=-1)
                 accuracy = (top_choice == ref_char).float().mean().item()
@@ -725,7 +743,6 @@ def train_remote():
                 new_logits = actor(input_seq)
                 new_logits = new_logits[:, -HORIZON:]
                 
-                # Policy loss
                 new_dist = torch.distributions.Categorical(logits=new_logits)
                 logp_new = new_dist.log_prob(flat_G)
                 
@@ -742,7 +759,6 @@ def train_remote():
                 pol_loss2 = -flat_adv * clipped_ratio
                 pol_loss = torch.max(pol_loss1, pol_loss2).mean()
                 
-                # Entropy and KL
                 entropy = new_dist.entropy().mean()
                 
                 ref_logits = ref(full_seq[:, -HORIZON-1:])[:, -HORIZON:]
@@ -754,10 +770,8 @@ def train_remote():
                 else:
                     current_kl_coef = min(BETA_KL, BETA_KL * chars_seen / max(1, KL_WARM))
                 
-                # Total loss
                 loss = (pol_loss + current_kl_coef * kl - ENTROPY_COEF * entropy) / GRAD_ACCUM
             
-            # Backward
             scaler.scale(loss).backward()
             total_loss += loss.item()
             
@@ -774,7 +788,6 @@ def train_remote():
         
         chars_seen += BATCH * HORIZON
         
-        # Update old policy every 5 iterations
         if it % 5 == 0:
             actor_old.load_state_dict(actor.state_dict())
             actor_old.eval()
@@ -805,6 +818,14 @@ def train_remote():
                 "chars": chars_seen,
                 "epoch": current_epoch,
             }, step=chars_seen)
+            
+            # Log n-gram curriculum weights if enabled
+            if USE_PRECOMPUTED_NGRAMS and USE_NGRAM_CURRICULUM:
+                wandb.log({
+                    "ngram_curriculum/bigram_weight": np.mean(all_metrics.get("ngram_weights_bigram", [0])),
+                    "ngram_curriculum/trigram_weight": np.mean(all_metrics.get("ngram_weights_trigram", [0])),
+                    "ngram_curriculum/fourgram_weight": np.mean(all_metrics.get("ngram_weights_fourgram", [0])),
+                }, step=chars_seen)
             
             if USE_CONFIDENCE_SCALING and old_probs is not None:
                 correct_confidence = old_probs[torch.arange(MICRO_BATCH), ref_char].mean().item()
@@ -839,36 +860,106 @@ def train_remote():
                     if not is_stable:
                         print(f"WARNING: Gradient instability! Variance: {grad_variance:.3f}")
         
-        # Generate samples periodically
         if it % SAMPLE_INTERVAL == 0:
             with torch.no_grad():
-                # Generate at different temperatures
-                test_ctx = ctx[:3]
-                samples = []
+                # Evaluate next character prediction accuracy
+                eval_ctx, eval_ref = loader.next()
                 
-                for i, temp in enumerate([0.8, 1.0, 1.2]):
-                    if i < test_ctx.shape[0]:
-                        gen = generate_with_temperature(
-                            actor, test_ctx[i:i+1], 150, 1, temperature=temp
-                        )[0, 0]
+                # Get model's predictions for next character
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    eval_logits = actor(eval_ctx)[:, -1, :]
+                
+                # Get top-1 predictions
+                predicted_chars = eval_logits.argmax(dim=-1)
+                correct = (predicted_chars == eval_ref[:, 0]).float()
+                top1_accuracy = correct.mean().item()
+                
+                # Get top-5 accuracy
+                _, top5_preds = eval_logits.topk(5, dim=-1)
+                top5_correct = (top5_preds == eval_ref[:, 0].unsqueeze(1)).any(dim=1).float()
+                top5_accuracy = top5_correct.mean().item()
+                
+                # Get model confidence (probability of predicted character)
+                probs = F.softmax(eval_logits, dim=-1)
+                pred_confidence = probs.gather(1, predicted_chars.unsqueeze(1)).squeeze().mean().item()
+                
+                # Compare with reference model
+                ref_logits = ref(eval_ctx)[:, -1, :]
+                ref_probs = F.softmax(ref_logits, dim=-1)
+                ref_predicted = ref_logits.argmax(dim=-1)
+                ref_correct = (ref_predicted == eval_ref[:, 0]).float().mean().item()
+                
+                # Generate text samples - 4 chars from 16 char context, 50 samples
+                num_samples = 50
+                context_len_for_eval = 16
+                gen_len = 4
+                
+                # Get fresh contexts for evaluation
+                eval_contexts = []
+                start_positions = []
+                for _ in range(num_samples):
+                    start_pos = torch.randint(context_len_for_eval, len(loader.data) - gen_len, (1,)).item()
+                    context = loader.data[start_pos - context_len_for_eval:start_pos]
+                    eval_contexts.append(context)
+                    start_positions.append(start_pos)
+                
+                eval_contexts = torch.stack(eval_contexts).to(DEV)
+                
+                # Generate 4 characters for each context
+                sample_data = []
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    for i in range(num_samples):
+                        ctx = eval_contexts[i:i+1]
+                        start_pos = start_positions[i]
                         
-                        sample_text = DEC(gen)
-                        context_text = DEC(test_ctx[i, -50:])
+                        # Generate greedily (take argmax at each step)
+                        generated = []
+                        for _ in range(gen_len):
+                            if len(generated) > 0:
+                                ctx_with_gen = torch.cat([ctx, torch.tensor(generated, device=DEV).unsqueeze(0)], dim=1)
+                                logits = actor(ctx_with_gen[:, -actor.context_len:])[:, -1, :]
+                            else:
+                                logits = actor(ctx[:, -actor.context_len:])[:, -1, :]
+                            
+                            next_char = logits.argmax(dim=-1)
+                            generated.append(next_char.item())
                         
-                        samples.append(f"[Temp={temp}] Context: ...{context_text}\nGenerated: {sample_text}")
+                        context_text = DEC(ctx[0].tolist())
+                        generated_text = DEC(generated)
+                        # Get the true next 4 characters that come after this context
+                        true_start = start_pos  # This is where the context ends
+                        true_text = DEC(loader.data[true_start:true_start + gen_len].tolist())
+                        
+                        correct = generated_text == true_text
+                        sample_data.append([i+1, context_text, generated_text, true_text, "✓" if correct else "✗"])
+                
+                # Calculate 4-char sequence accuracy
+                num_correct_sequences = sum(1 for row in sample_data if row[4] == "✓")
+                sequence_accuracy = num_correct_sequences / num_samples
+                
+                # Create a wandb table
+                sample_table = wandb.Table(
+                    columns=["Sample", "Context (16 chars)", "Generated (4 chars)", "True (4 chars)", "Correct"],
+                    data=sample_data
+                )
                 
                 wandb.log({
-                    "samples": wandb.Html(
-                        "<pre>" + "\n\n".join(samples) + "</pre>"
-                    )
+                    "eval/next_char_accuracy": top1_accuracy,
+                    "eval/top5_accuracy": top5_accuracy,
+                    "eval/prediction_confidence": pred_confidence,
+                    "eval/ref_model_accuracy": ref_correct,
+                    "eval/accuracy_improvement": top1_accuracy - ref_correct,
+                    "eval/4char_sequence_accuracy": sequence_accuracy,
+                    "eval/4char_correct_count": num_correct_sequences,
+                    "text_samples": sample_table
                 }, step=chars_seen)
         
-        # Evaluation
         if it % EVAL_INTERVAL == 0:
             actor.eval()
             with torch.no_grad():
                 val_ctx, val_ref = loader.next()
                 
+                # Standard cross-entropy evaluation
                 with torch.amp.autocast('cuda',dtype = torch.bfloat16):
                     val_logits = actor(val_ctx)
                     val_logits = val_logits[:, -HORIZON:, :]
@@ -880,12 +971,33 @@ def train_remote():
                 
                 perplexity = torch.exp(val_loss)
                 
+                # Also evaluate using our training methodology (exhaustive rewards)
+                if USE_EXHAUSTIVE and HORIZON == 1:
+                    all_chars, log_probs = generate_exhaustive_single_char(actor, val_ctx, V)
+                    val_probs = torch.exp(log_probs)
+                    rewards = compute_exhaustive_rewards(all_chars, val_ref[:, 0], ref, val_ctx, V, 
+                                                       model_log_probs=log_probs,
+                                                       old_probs=val_probs if USE_CONFIDENCE_SCALING else None)
+                    
+                    # Check which character gets highest reward
+                    best_reward_chars = rewards.argmax(dim=-1)
+                    reward_based_accuracy = (best_reward_chars == val_ref[:, 0]).float().mean().item()
+                    
+                    # Average reward for correct predictions
+                    correct_rewards = rewards[torch.arange(val_ctx.shape[0]), val_ref[:, 0]]
+                    avg_correct_reward = correct_rewards.mean().item()
+                    
+                    wandb.log({
+                        "eval/reward_based_accuracy": reward_based_accuracy,
+                        "eval/avg_correct_reward": avg_correct_reward,
+                        "eval/reward_variance": rewards.var().item()
+                    }, step=chars_seen)
+                
                 wandb.log({
                     "eval/perplexity": perplexity.item(),
                     "eval/loss": val_loss.item(),
                 }, step=chars_seen)
     
-    # Final summary
     wandb.summary.update({
         "final_accuracy": avg_metrics.get("accuracy", 0) if 'avg_metrics' in locals() else 0,
         "final_perplexity": perplexity.item() if 'perplexity' in locals() else None,
