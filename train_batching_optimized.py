@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
-PROJECT_NAME = "avataRL-cleanlogs_and_evals"
-EXPERIMENT_NAME = "iter-onthefly-ngrams-freqlog-decaylr-cosineincreasingkl-highklwarmup-cosine-free-fraction-0.5"
+PROJECT_NAME = "avataRL-optimized-grpo"
+EXPERIMENT_NAME = "continuous-batch-paged-attn-grpo"
 
 CONTEXT_LEN =32
 HORIZON = 1
@@ -24,7 +24,7 @@ EVAL_TEMPERATURE = 1.0
 MIN_VARIANCE = 0.1
 USE_EXHAUSTIVE = True
 USE_CONFIDENCE_SCALING = True
-CONFIDENCE_WEIGHT = 1.0
+CONFIDENCE_WEIGHT = 0.7
 CONFIDENCE_CLIP = 2.0
 ENABLE_CONFIDENCE_PENALTY = True
 
@@ -58,17 +58,24 @@ SAMPLE_INTERVAL = int(ITERS_PER_EPOCH * 0.1)
 USE_AMP = True
 AMP_DTYPE = "bfloat16"           
 
+USE_CONTINUOUS_BATCHING = True
+MAX_BATCH_TOKENS = 4096  # Maximum tokens in a batch
+DYNAMIC_BATCH_SIZE = True  # Adjust batch size dynamically based on sequence lengths
+
+USE_PAGED_ATTENTION = True
+PAGE_SIZE = 512  # Size of each attention page
+MAX_PAGES_PER_SEQ = 8  # Maximum pages per sequence
+
 import requests, torch, torch.nn as nn, torch.nn.functional as F
 from pathlib import Path
 from tqdm import tqdm
-import modal, wandb, copy
+import modal, wandb
 from collections import defaultdict, deque
 import numpy as np
 import math
 from typing import Dict, List, Tuple, Optional
 from torch.cuda.amp import autocast, GradScaler
-from functools import partial
-import warnings
+import gc
 
 
 stub = modal.App(f"{PROJECT_NAME}-{EXPERIMENT_NAME}")
@@ -155,6 +162,11 @@ class OptimizedAttention(nn.Module):
                 self.use_flash_attn = True
             except:
                 pass
+        
+        self.use_paged_attention = USE_PAGED_ATTENTION if 'USE_PAGED_ATTENTION' in globals() else False
+        if self.use_paged_attention:
+            self.page_size = PAGE_SIZE if 'PAGE_SIZE' in globals() else 512
+            self.kv_cache = None
     
                 
     def forward(self, x, mask=None):
@@ -176,20 +188,58 @@ class OptimizedAttention(nn.Module):
                 packed = packed.to(torch.bfloat16)
             out = self.flash_attn_func(packed, causal=True, dropout_p=self.dropout.p if self.training else 0.0)
             out = out.to(dtype0).reshape(B, T, C)
+        elif self.use_paged_attention:
+            out = self._paged_attention(q, k, v, mask)
+            out = self.o_proj(out)
         else:
-            q, k, v = qkv.unbind(dim=2)
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            
-            # Scaled dot-product attention
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2).contiguous().view(B, T, C) 
             out = self.o_proj(y)
         return out
+    
+    def _paged_attention(self, q, k, v, mask=None):
+        B, H, T, D = q.shape
+        
+        num_pages = (T + self.page_size - 1) // self.page_size
+        
+        output = torch.zeros(B, H, T, D, device=q.device, dtype=q.dtype)
+        
+        for page_idx in range(num_pages):
+            start_idx = page_idx * self.page_size
+            end_idx = min((page_idx + 1) * self.page_size, T)
+            page_len = end_idx - start_idx
+            
+            q_page = q[:, :, start_idx:end_idx, :]
+            
+            k_context = k[:, :, :end_idx, :]
+            v_context = v[:, :, :end_idx, :]
+            
+            scores = torch.matmul(q_page, k_context.transpose(-2, -1)) / math.sqrt(D)
+            
+            if mask is not None:
+                mask_page = mask[start_idx:end_idx, :end_idx]
+                scores = scores.masked_fill(mask_page.unsqueeze(0).unsqueeze(0), float('-inf'))
+            else:
+                causal_mask = torch.triu(torch.ones(page_len, end_idx, device=q.device), 
+                                       diagonal=start_idx+1-end_idx).bool()
+                scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            
+            attn_weights = F.softmax(scores, dim=-1)
+            
+            if self.training and self.dropout.p > 0:
+                attn_weights = F.dropout(attn_weights, p=self.dropout.p)
+            
+            page_output = torch.matmul(attn_weights, v_context)
+            output[:, :, start_idx:end_idx, :] = page_output
+        
+        output = output.transpose(1, 2).contiguous().view(B, T, -1)
+        return output
 
 def norm(x):
+    """RMSNorm implementation - compatible with PyTorch 2.3"""
+    # Add epsilon for numerical stability
     eps = 1e-8
+    # Manual RMSNorm with stability checks
     rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + eps)
     return x / rms
 
@@ -392,6 +442,84 @@ def build_char_frequencies(text, stoi, V):
     char_freq = char_counts / char_counts.sum()
     return char_freq
 
+
+class ContinuousBatchGenerator:
+    def __init__(self, model, context_len, vocab_size, device="cuda"):
+        self.model = model
+        self.context_len = context_len
+        self.vocab_size = vocab_size
+        self.device = device
+        
+        self.max_concurrent = 8192
+        self.kv_cache = None
+        
+    @torch.no_grad()
+    def generate_continuous_batch(self, contexts, num_samples_per_context, temperature=1.0, max_tokens=1):
+        B = contexts.shape[0]
+        total_sequences = B * num_samples_per_context
+        
+        if USE_CONTINUOUS_BATCHING and DYNAMIC_BATCH_SIZE:
+            seq_len = contexts.shape[1] + max_tokens
+            memory_per_seq = seq_len * N_EMB * 4 * 3
+            
+            available_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+            max_sequences = min(total_sequences, int(available_memory * 0.95 / memory_per_seq))
+            
+            if max_sequences < total_sequences:
+                return self._generate_chunked(contexts, num_samples_per_context, temperature, max_tokens, max_sequences)
+        
+        sequences = contexts.repeat_interleave(num_samples_per_context, dim=0)
+        
+        done = torch.zeros(total_sequences, dtype=torch.bool, device=self.device)
+        generated_tokens = torch.zeros(total_sequences, max_tokens, dtype=torch.long, device=self.device)
+        
+        for step in range(max_tokens):
+            active_mask = ~done
+            if not active_mask.any():
+                break
+                
+            active_sequences = sequences[active_mask]
+            
+            if active_sequences.shape[1] > self.context_len:
+                active_sequences = active_sequences[:, -self.context_len:]
+            
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                logits = self.model(active_sequences)[:, -1, :] / temperature
+            
+            probs = F.softmax(logits, dim=-1)
+            next_tokens = torch.multinomial(probs, 1).squeeze(-1)
+            
+            generated_tokens[active_mask, step] = next_tokens
+            
+            sequences = torch.cat([
+                sequences,
+                torch.zeros(total_sequences, 1, dtype=torch.long, device=self.device)
+            ], dim=1)
+            sequences[active_mask, -1] = next_tokens
+            
+            if max_tokens == 1:
+                done.fill_(True)
+        
+        return generated_tokens.reshape(B, num_samples_per_context, max_tokens)
+    
+    def _generate_chunked(self, contexts, num_samples_per_context, temperature, max_tokens, chunk_size):
+        B = contexts.shape[0]
+        all_generated = []
+        
+        for i in range(0, B, chunk_size // num_samples_per_context):
+            end_idx = min(i + chunk_size // num_samples_per_context, B)
+            chunk_contexts = contexts[i:end_idx]
+            
+            chunk_generated = self.generate_continuous_batch(
+                chunk_contexts, num_samples_per_context, temperature, max_tokens
+            )
+            all_generated.append(chunk_generated)
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        return torch.cat(all_generated, dim=0)
+
 @torch.no_grad()
 def generate_with_temperature(model, contexts, horizon, K, temperature=1.0):
     B = contexts.shape[0]
@@ -586,7 +714,7 @@ def train_remote():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
-    torch.cuda.set_per_process_memory_fraction(0.95)
+    torch.cuda.set_per_process_memory_fraction(0.98)
     
     DEV = "cuda"
     ensure_dataset()
@@ -601,6 +729,9 @@ def train_remote():
     print(f"Using Exhaustive Exploration: {USE_EXHAUSTIVE} (exploring all {V} characters)")
     print(f"Using On-the-fly N-grams")
     print(f"Training for {EPOCHS} epochs ({TOTAL_ITERS:,} iterations, {ITERS_PER_EPOCH:,} iters/epoch)")
+    print(f"Using Continuous Batching: {USE_CONTINUOUS_BATCHING}")
+    print(f"Dynamic Batch Size: {DYNAMIC_BATCH_SIZE}")
+    print(f"Using Paged Attention: {USE_PAGED_ATTENTION} (page size: {PAGE_SIZE})")
     
     print("Building on-the-fly n-gram reference model...")
     ref = OnTheFlyNGramRef(text, stoi, V).to(DEV).eval()
@@ -608,6 +739,12 @@ def train_remote():
     
     actor = GPT(V).to(DEV)
     actor_old = GPT(V).to(DEV)
+    
+    continuous_generator = None
+    if USE_CONTINUOUS_BATCHING:
+        print("Initializing continuous batch generator...")
+        continuous_generator = ContinuousBatchGenerator(actor_old, CONTEXT_LEN, V, device=DEV)
+        print("Continuous batch generator initialized")
     
     
     actor_old.load_state_dict(actor.state_dict())
@@ -675,6 +812,11 @@ def train_remote():
                 "flash_attention": USE_FLASH_ATTN,
                 "mixed_precision": USE_AMP,
                 "amp_dtype": AMP_DTYPE,
+                "continuous_batching": USE_CONTINUOUS_BATCHING,
+                "dynamic_batch_size": DYNAMIC_BATCH_SIZE,
+                "max_batch_tokens": MAX_BATCH_TOKENS,
+                "paged_attention": USE_PAGED_ATTENTION,
+                "page_size": PAGE_SIZE,
             }
         }
     )
@@ -705,7 +847,12 @@ def train_remote():
             
             if USE_EXHAUSTIVE and HORIZON == 1:
                 with torch.no_grad():
-                    G = generate_with_temperature(actor_old, ctx, HORIZON, K_SAMPLES, temperature=TEMPERATURE)
+                    if USE_CONTINUOUS_BATCHING and continuous_generator is not None:
+                        G = continuous_generator.generate_continuous_batch(
+                            ctx, K_SAMPLES, temperature=TEMPERATURE, max_tokens=HORIZON
+                        )
+                    else:
+                        G = generate_with_temperature(actor_old, ctx, HORIZON, K_SAMPLES, temperature=TEMPERATURE)
                 
                 with torch.no_grad():
                     model_logits = actor_old(ctx[:, -actor_old.context_len:])[:, -1, :]
@@ -918,6 +1065,8 @@ def train_remote():
         if it % 5 == 0:
             actor_old.load_state_dict(actor.state_dict())
             actor_old.eval()
+            if USE_CONTINUOUS_BATCHING and continuous_generator is not None:
+                continuous_generator.model = actor_old
         
         if it % LOG_INTERVAL == 0:
             R_all = torch.cat(all_R, dim=0) if all_R else R
