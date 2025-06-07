@@ -69,7 +69,9 @@ from typing import Dict, List, Tuple, Optional
 from torch.cuda.amp import autocast, GradScaler
 from functools import partial
 import warnings
-
+import torch.distributed as dist
+import os
+import torch.multiprocessing as mp
 
 stub = modal.App(f"{PROJECT_NAME}-{EXPERIMENT_NAME}")
 
@@ -83,7 +85,17 @@ image = (
 
 DATA_URL = ("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/"
             "tinyshakespeare/input.txt")
+### distributed helpers: 
+def ddp_setup(rank: int, world_size: int):
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")   # any free port
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
+def ddp_cleanup():
+    """Tear down distributed process group."""
+    dist.barrier()
+    dist.destroy_process_group()
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x[..., ::2], x[..., 1::2]
@@ -175,7 +187,8 @@ class OptimizedAttention(nn.Module):
             if dtype0 not in (torch.float16, torch.bfloat16):
                 packed = packed.to(torch.bfloat16)
             out = self.flash_attn_func(packed, causal=True, dropout_p=self.dropout.p if self.training else 0.0)
-            out = out.to(dtype0).reshape(B, T, C)
+            # out = out.to(dtype0).reshape(B, T, C)
+            out = self.o_proj(out.to(dtype0).reshape(B, T, C))
         else:
             q, k, v = qkv.unbind(dim=2)
             q = q.transpose(1, 2)
@@ -575,21 +588,30 @@ class ConfidenceMonitor:
         is_stable = grad_variance < 10.0 and grad_trend < 0.1
         return is_stable, grad_variance
 
-@stub.function(
-    gpu=GPU_TYPE, 
-    image=image, 
-    timeout=60*60*6,
-    secrets=[modal.Secret.from_name("wandb")]
-)
-def train_remote():
-    torch.set_float32_matmul_precision("high")
+
+
+def train_worker(rank: int, world_size: int):
+    """Runs on each GPU (spawned by mp)."""
+
+    # A. DDP setup ----------------------------------------------------
+    ddp_setup(rank, world_size)            ### ← NEW (DDP)
+
+    # Disable wandb on non-zero ranks to keep one logging stream
+    if rank != 0:                                  ### ← NEW (DDP)
+        os.environ["WANDB_MODE"] = "disabled"      ### ← NEW (DDP)
+
+    
+
+    world_size = torch.cuda.device_count()
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     torch.cuda.set_per_process_memory_fraction(0.95)
     
-    DEV = "cuda"
-    ensure_dataset()
+    DEV = f"cuda:{rank}"                           ### ← NEW (DDP: per-rank)
+    if rank == 0:
+        ensure_dataset()
+    dist.barrier()             # ← every rank waits until file is complete  
     ENC, DEC, V, stoi, itos, text = build_vocab()
     
     print(f"Starting GRPO V2 training with Flash Attention")
@@ -616,6 +638,15 @@ def train_remote():
     param_count = sum(p.numel() for p in actor.parameters())
     print(f"Total parameters: {param_count:,}")
     
+    # ------- DDP WRAP (must come **after** param_count) -------
+    actor = torch.nn.parallel.DistributedDataParallel(
+        actor,
+        device_ids=[rank],
+        output_device=rank,
+        find_unused_parameters=True
+    )                                             ### ← NEW (DDP)
+    # ----------------------------------------------------------
+    
     opt = torch.optim.AdamW(actor.parameters(), lr=LR, weight_decay=WEIGHT_DECAY, betas=(0.9, 0.95))
     
     scheduler = None
@@ -636,7 +667,7 @@ def train_remote():
             decay_rate = (MIN_LR / LR) ** (1 / (TOTAL_ITERS - WARMUP_ITERS))
             scheduler = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=decay_rate)
     
-    scaler = GradScaler(enabled=USE_AMP)
+    scaler = torch.cuda.amp.GradScaler(init_scale=2.**16)
     
     loader = ContextualTextLoader(text, ENC, MICRO_BATCH, HORIZON, CONTEXT_LEN, device=DEV)
     kl_controller = AdaptiveKLController(KL_TARGET) if ADAPTIVE_KL else None
@@ -645,7 +676,7 @@ def train_remote():
     
     run = wandb.init(
         project=PROJECT_NAME,
-        name=EXPERIMENT_NAME,
+        name=EXPERIMENT_NAME if rank == 0 else None,            # keep single run name
         config={
             "model": {
                 "vocab_size": V,
@@ -791,7 +822,7 @@ def train_remote():
             full_seq = torch.cat([ctx_for_loss, flat_G], dim=1)
             
             with torch.amp.autocast('cuda',dtype = torch.bfloat16):
-                input_seq = full_seq[:, -actor.context_len:]
+                input_seq = full_seq[:, -actor.module.context_len:] if isinstance(actor, torch.nn.parallel.DistributedDataParallel) else full_seq[:, -actor.context_len:]  ### ← NEW (DDP safe)
                 
                 if torch.isnan(input_seq).any():
                     print(f"ERROR: NaN in input_seq at iteration {it}, accum_step {accum_step}")
@@ -879,8 +910,14 @@ def train_remote():
                 
                 loss = (pol_loss + current_kl_coef * kl) / GRAD_ACCUM
             
-            scaler.scale(loss).backward()
-            total_loss += loss.item()
+            loss = (pol_loss + current_kl_coef * kl) / GRAD_ACCUM
+
+            if accum_step < GRAD_ACCUM - 1:
+                # postpone gradient reduction until the last mini-step
+                with actor.no_sync():        #  ←← key line
+                    scaler.scale(loss).backward()
+            else:
+                scaler.scale(loss).backward()
             
             all_metrics["kl"].append(kl.item())
             all_metrics["pol_loss"].append(pol_loss.item())
@@ -916,7 +953,7 @@ def train_remote():
         chars_seen += BATCH * HORIZON
         
         if it % 5 == 0:
-            actor_old.load_state_dict(actor.state_dict())
+            actor_old.load_state_dict(actor.module.state_dict() if isinstance(actor, torch.nn.parallel.DistributedDataParallel) else actor.state_dict())  ### ← NEW (DDP safe)
             actor_old.eval()
         
         if it % LOG_INTERVAL == 0:
@@ -941,7 +978,6 @@ def train_remote():
                 "epoch": current_epoch,
                 "learning_rate": opt.param_groups[0]['lr'],
             }, step=chars_seen)
-            
             
             if USE_CONFIDENCE_SCALING and old_probs is not None:
                 ref_first_char = ref_tok[:, 0]
@@ -1086,7 +1122,7 @@ def train_remote():
                     "eval/loss": val_loss.item(),
                 }, step=chars_seen)
     
-    wandb.summary.update({
+        wandb.summary.update({
         "final_accuracy": avg_metrics.get("accuracy", 0) if 'avg_metrics' in locals() else 0,
         "final_perplexity": perplexity.item() if 'perplexity' in locals() else None,
         "total_chars_seen": chars_seen,
@@ -1094,10 +1130,17 @@ def train_remote():
     })
     
     run.finish()
+    ddp_cleanup()
 
-@stub.local_entrypoint()
+@stub.function(
+    gpu=f"{GPU_TYPE}:2",          # "A100:2" for 2×A100, etc.
+    image=image,
+    timeout=60 * 60 * 6,
+    secrets=[modal.Secret.from_name("wandb")],
+)
 def main():
-    train_remote.remote()
+    world_size = torch.cuda.device_count()
+    mp.spawn(train_worker, args=(world_size,), nprocs=world_size, join=True)
 
 if __name__ == "__main__":
     main()
