@@ -1,4 +1,4 @@
-# avatarl
+# avataRL
 
 training a tinyshakespeare model -> zero pretrain, all rl baby.
 

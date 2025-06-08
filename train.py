@@ -887,7 +887,7 @@ def train_remote():
     
     # Final summary
     wandb.summary.update({
-        "final_accuracy": avg_metrics.get("accuracy", 0) if 'avg_metrics' in locals() else 0,
+        "final_accuracy": np.mean(all_metrics.get("accuracy", [0])) if all_metrics else 0,
         "final_perplexity": perplexity.item() if 'perplexity' in locals() else None,
         "total_chars_seen": chars_seen,
         "peak_gpu_memory_gb": torch.cuda.max_memory_allocated() / 1e9,
