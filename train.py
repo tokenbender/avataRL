@@ -565,7 +565,7 @@ def setup_distributed():
     """Initialize distributed training environment"""
     # Get environment variables set by torchrun
     rank = int(os.environ.get("RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     
     # Set device - Modal guarantees GPUs
