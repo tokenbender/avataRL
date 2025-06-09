@@ -29,8 +29,9 @@ DATASET_SIZE = 1_115_394
 ITERS_PER_EPOCH = DATASET_SIZE // BATCH
 TOTAL_ITERS = ITERS_PER_EPOCH * EPOCHS
 LR = 3e-3
-BETA_KL = 1e-3
-KL_WARM = 50_000
+BETA_KL = 0.1
+KL_WARM = int(DATASET_SIZE * 0.8)
+KL_FREE_FRACTION = 0.1
 
 N_LAYER = 6
 N_HEAD = 6
@@ -46,7 +47,7 @@ CLIP_RATIO = 0.5
 ENTROPY_COEF = 0.08
 MIN_VARIANCE = 0.1
 USE_CONFIDENCE_SCALING = True
-CONFIDENCE_WEIGHT = 0.5
+CONFIDENCE_WEIGHT = 0.7
 CONFIDENCE_CLIP = 2.0
 ENABLE_CONFIDENCE_PENALTY = True
 
@@ -57,6 +58,12 @@ DYNAMIC_BATCH_SIZE = True
 USE_PAGED_ATTENTION = False
 PAGE_SIZE = 1024
 MAX_PAGES_PER_SEQ = 8
+
+# Learning rate scheduling
+USE_LR_DECAY = True
+LR_DECAY_TYPE = "cosine"  # Options: "cosine", "linear", "exponential"
+MIN_LR = 1e-5
+WARMUP_ITERS = 100
 
 def norm(x: torch.Tensor) -> torch.Tensor:
     """RMSNorm implementation using PyTorch built-in"""
@@ -894,6 +901,7 @@ def compute_exhaustive_rewards(all_chars: torch.Tensor, ref_char: torch.Tensor, 
 def compute_rewards_multi_char(gen: torch.Tensor, ref: torch.Tensor, ref_logits: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
     """
     Compute rewards for multi-character generation with detailed metrics
+    Matches train_batching_optimized.py implementation
     """
     # Exact match reward
     exact_match = (gen == ref).float()
@@ -904,11 +912,11 @@ def compute_rewards_multi_char(gen: torch.Tensor, ref: torch.Tensor, ref_logits:
         # Get probability of generated token under reference
         B, T = gen.shape
         gen_probs = ref_probs.gather(2, gen.unsqueeze(-1)).squeeze(-1)
-        # Log probability as partial reward
-        partial_reward = torch.log(gen_probs + 1e-10) / 10.0  # Scale down
+        # Partial reward from reference model
+        partial_reward = gen_probs
     
-    # Combined reward
-    reward = exact_match + 0.1 * partial_reward
+    # Combined reward (matching train_batching_optimized.py)
+    reward = exact_match + partial_reward
     
     metrics = {
         "accuracy": exact_match.mean().item(),
@@ -1324,6 +1332,25 @@ def train_grpo():
     # Create optimizer (only for actor)
     optimizer = torch.optim.AdamW(actor.parameters(), lr=LR, weight_decay=0.01, betas=(0.9, 0.95))
     
+    # Learning rate scheduler
+    scheduler = None
+    if USE_LR_DECAY:
+        if LR_DECAY_TYPE == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=TOTAL_ITERS - WARMUP_ITERS, eta_min=MIN_LR
+            )
+        elif LR_DECAY_TYPE == "linear":
+            def linear_schedule(step):
+                if step < WARMUP_ITERS:
+                    return step / WARMUP_ITERS
+                else:
+                    progress = (step - WARMUP_ITERS) / (TOTAL_ITERS - WARMUP_ITERS)
+                    return (1 - progress) * (1 - MIN_LR/LR) + MIN_LR/LR
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=linear_schedule)
+        elif LR_DECAY_TYPE == "exponential":
+            decay_rate = (MIN_LR / LR) ** (1 / (TOTAL_ITERS - WARMUP_ITERS))
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
+    
     # Create data loader
     loader = DistributedContextualTextLoader(
         text=text,
@@ -1462,8 +1489,12 @@ def train_grpo():
                         full_seq = torch.cat([ctx, gen], dim=1)
                         ref_logits = ref_model(full_seq[:, -HORIZON-1:])[:, -HORIZON:]
                     
-                    reward = compute_rewards_multi_char(gen, ref_tok, ref_logits)
-                    R[:, k, :] = reward[0]  # Just the reward tensor, not metrics
+                    reward, metrics = compute_rewards_multi_char(gen, ref_tok, ref_logits)
+                    R[:, k, :] = reward
+                    
+                    # Store metrics from reward computation
+                    for key, val in metrics.items():
+                        iter_metrics[key].append(val)
                 
                 # Compute advantages
                 base = R.mean(dim=1, keepdim=True)
