@@ -22,13 +22,13 @@ app = modal.App("grpo-multi-gpu")
 CONTEXT_LEN = 32
 HORIZON = 1
 BATCH = 16384
-MICRO_BATCH = 128
+MICRO_BATCH = 256
 GRAD_ACCUM = BATCH // (MICRO_BATCH * N_GPUS)
-EPOCHS = 3
+EPOCHS = 1
 DATASET_SIZE = 1_115_394
 ITERS_PER_EPOCH = DATASET_SIZE // BATCH
 TOTAL_ITERS = ITERS_PER_EPOCH * EPOCHS
-LR = 3e-5
+LR = 3e-3
 BETA_KL = 1e-3
 KL_WARM = 50_000
 
@@ -40,7 +40,7 @@ BUCKET_SIZE_MB = 30
 
 USE_FLASH_ATTN = True
 USE_EXHAUSTIVE = True
-K_SAMPLES = 64
+K_SAMPLES = 32
 TEMPERATURE = 1.0
 CLIP_RATIO = 0.5
 ENTROPY_COEF = 0.08
@@ -50,20 +50,17 @@ CONFIDENCE_WEIGHT = 0.5
 CONFIDENCE_CLIP = 2.0
 ENABLE_CONFIDENCE_PENALTY = True
 
-USE_CONTINUOUS_BATCHING = True
-MAX_BATCH_TOKENS = 4096
+USE_CONTINUOUS_BATCHING = False
+MAX_BATCH_TOKENS = 8192
 DYNAMIC_BATCH_SIZE = True
 
-USE_PAGED_ATTENTION = True
-PAGE_SIZE = 512
+USE_PAGED_ATTENTION = False
+PAGE_SIZE = 1024
 MAX_PAGES_PER_SEQ = 8
 
 def norm(x: torch.Tensor) -> torch.Tensor:
-    """RMSNorm implementation - more efficient than LayerNorm"""
-    # Manual RMSNorm implementation for compatibility
-    eps = 1e-8
-    rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + eps)
-    return x / rms
+    """RMSNorm implementation using PyTorch built-in"""
+    return F.rms_norm(x, (x.size(-1),))
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Helper for rotary embeddings"""
@@ -85,6 +82,73 @@ class RotaryCache(nn.Module):
         sin = self.sin_base[:seq_len].repeat_interleave(2, dim=-1)
         cos = self.cos_base[:seq_len].repeat_interleave(2, dim=-1)
         return sin[None, None, :, :], cos[None, None, :, :]
+
+class KVCache(nn.Module):
+    """
+    KV cache for efficient inference - caches past key and values during generation.
+    Based on Meta's implementation for torchtune.
+    """
+    def __init__(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        cache_shape = (batch_size, num_kv_heads, max_seq_len, head_dim)
+        self.register_buffer(
+            "k_cache", torch.zeros(cache_shape, dtype=dtype), persistent=False
+        )
+        self.register_buffer(
+            "v_cache", torch.zeros(cache_shape, dtype=dtype), persistent=False
+        )
+        self.register_buffer(
+            "cache_pos", torch.arange(0, cache_shape[2]), persistent=False
+        )
+        self.batch_size = batch_size
+        self.max_seq_len = max_seq_len
+
+    def reset(self) -> None:
+        """Reset the cache to zero."""
+        self.k_cache.zero_()
+        self.v_cache.zero_()
+        self.cache_pos -= self.size
+
+    @property
+    def size(self) -> int:
+        return self.cache_pos[0].item()
+
+    def update(
+        self, k_val: torch.Tensor, v_val: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Update KV cache with new k_val, v_val and return the updated cache.
+        Args:
+            k_val: Current key tensor with shape [B, H, S, D]
+            v_val: Current value tensor with shape [B, H, S, D]
+        Returns:
+            Updated key and value cache tensors
+        """
+        bsz, _, seq_len, _ = k_val.shape
+        if bsz > self.k_cache.shape[0]:
+            raise ValueError(
+                f"Cache batch size is {self.k_cache.shape[0]} but got {bsz}"
+            )
+
+        assert (self.cache_pos[0] + seq_len) <= self.k_cache.shape[2]
+        
+        k_out = self.k_cache
+        v_out = self.v_cache
+
+        k_out[:, :, self.cache_pos[:seq_len]] = k_val
+        v_out[:, :, self.cache_pos[:seq_len]] = v_val
+
+        # Update position tracker
+        self.cache_pos.add_(seq_len)
+
+        return k_out, v_out
 
 class ReLUSquared(nn.Module):
     """ReLU squared activation - faster than GELU, better than plain ReLU"""
@@ -118,14 +182,41 @@ class OptimizedAttention(nn.Module):
             except ImportError:
                 print("Flash Attention not available, using standard attention")
         
-        self.use_paged_attention = USE_PAGED_ATTENTION if 'USE_PAGED_ATTENTION' in globals() else False
-        if self.use_paged_attention:
-            self.page_size = PAGE_SIZE if 'PAGE_SIZE' in globals() else 512
-            self.kv_cache = None
+        self.use_paged_attention = False
+        
+        # KV cache for inference (not used during training)
+        self.kv_cache = None
+        self.cache_enabled = False
     
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def init_kv_cache(self, batch_size: int, max_seq_len: int, dtype: torch.dtype = torch.bfloat16):
+        """Initialize KV cache for inference"""
+        self.kv_cache = KVCache(
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            num_kv_heads=self.n_head,
+            head_dim=self.head_dim,
+            dtype=dtype
+        )
+        self.cache_enabled = True
+    
+    def reset_kv_cache(self):
+        """Reset the KV cache"""
+        if self.kv_cache is not None:
+            self.kv_cache.reset()
+    
+    def disable_kv_cache(self):
+        """Disable KV cache (for training)"""
+        self.cache_enabled = False
+        self.kv_cache = None
+    
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, use_cache: bool = False) -> torch.Tensor:
         B, T, C = x.shape
         
+        # Use KV cache if enabled and requested
+        if use_cache and self.cache_enabled and self.kv_cache is not None:
+            return self._forward_with_cache(x, mask)
+        
+        # Standard forward pass (for training)
         # Compute QKV in one go
         qkv = self.qkv(x).reshape(B, T, 3, self.n_head, self.head_dim)
         
@@ -166,72 +257,50 @@ class OptimizedAttention(nn.Module):
             # QK normalization
             q, k = norm(q), norm(k)
             
-            if self.use_paged_attention:
-                # Paged attention path
-                out = self._paged_attention(q, k, v, mask)
-                out = out.view(B, T, C)
-            else:
-                # Scaled dot-product attention with causal mask
-                # Note: is_causal=True automatically applies causal masking
-                # Additional mask parameter could be used for padding masks if needed
-                out = F.scaled_dot_product_attention(q, k, v, is_causal=True, attn_mask=mask)
-                out = out.transpose(1, 2).contiguous().view(B, T, C)
+            # Scaled dot-product attention with causal mask
+            # Note: is_causal=True automatically applies causal masking
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            out = out.transpose(1, 2).contiguous().view(B, T, C)
         
         return self.o_proj(out)
     
-    def _paged_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
-                        mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Paged attention implementation for memory-efficient processing
-        Processes attention in pages to reduce memory usage
-        """
-        B, H, T, D = q.shape
+    def _forward_with_cache(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass using KV cache for efficient inference"""
+        B, T, C = x.shape
         
-        # Number of pages needed
-        num_pages = (T + self.page_size - 1) // self.page_size
+        # Compute QKV
+        qkv = self.qkv(x).reshape(B, T, 3, self.n_head, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         
-        # Output tensor
-        output = torch.zeros(B, H, T, D, device=q.device, dtype=q.dtype)
+        # Apply RoPE to current position
+        cache_size = self.kv_cache.size
+        sin, cos = self.rope(cache_size + T)
+        # Only apply to new positions
+        sin_new = sin[:, :, cache_size:cache_size+T, :]
+        cos_new = cos[:, :, cache_size:cache_size+T, :]
         
-        for page_idx in range(num_pages):
-            start_idx = page_idx * self.page_size
-            end_idx = min((page_idx + 1) * self.page_size, T)
-            page_len = end_idx - start_idx
-            
-            # Get query page
-            q_page = q[:, :, start_idx:end_idx, :]
-            
-            # For causal attention, we need all keys/values up to current position
-            k_context = k[:, :, :end_idx, :]
-            v_context = v[:, :, :end_idx, :]
-            
-            # Compute attention scores
-            scores = torch.matmul(q_page, k_context.transpose(-2, -1)) / math.sqrt(D)
-            
-            # Apply mask
-            if mask is not None:
-                mask_page = mask[start_idx:end_idx, :end_idx]
-                scores = scores.masked_fill(mask_page.unsqueeze(0).unsqueeze(0), float('-inf'))
-            else:
-                # Create causal mask for this page
-                causal_mask = torch.triu(torch.ones(page_len, end_idx, device=q.device), 
-                                       diagonal=start_idx+1-end_idx).bool()
-                scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-            
-            # Apply softmax
-            attn_weights = F.softmax(scores, dim=-1)
-            
-            # Apply dropout if training
-            if self.training and self.dropout.p > 0:
-                attn_weights = F.dropout(attn_weights, p=self.dropout.p)
-            
-            # Compute attention output for this page
-            page_output = torch.matmul(attn_weights, v_context)
-            output[:, :, start_idx:end_idx, :] = page_output
+        q = (q * cos_new) + (_rotate_half(q) * sin_new)
+        k = (k * cos_new) + (_rotate_half(k) * sin_new)
         
-        # Reshape to [B, T, H*D]
-        output = output.transpose(1, 2).contiguous().view(B, T, -1)
-        return output
+        # Normalize
+        q, k = norm(q), norm(k)
+        
+        # Update KV cache
+        k_cache, v_cache = self.kv_cache.update(k, v)
+        
+        # Compute attention with cached keys/values
+        # Get only the valid portion of cache
+        valid_cache_size = self.kv_cache.size
+        k_valid = k_cache[:, :, :valid_cache_size, :]
+        v_valid = v_cache[:, :, :valid_cache_size, :]
+        
+        # Standard attention computation
+        out = F.scaled_dot_product_attention(q, k_valid, v_valid, is_causal=False)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        
+        return self.o_proj(out)
+    
 
 class TransformerBlock(nn.Module):
     """Transformer block with pre-norm architecture"""
@@ -239,17 +308,17 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attn = OptimizedAttention(n_emb, n_head, dropout)
         
-        # Feed-forward network with GELU (matching train_batching_optimized.py)
+        # Feed-forward network with ReLU squared
         self.ffn = nn.Sequential(
             nn.Linear(n_emb, 4 * n_emb, bias=False),
-            nn.GELU(approximate='tanh'),
+            ReLUSquared(),
             nn.Linear(4 * n_emb, n_emb, bias=False),
             nn.Dropout(dropout)
         )
     
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, use_cache: bool = False) -> torch.Tensor:
         # Pre-norm architecture with residual connections
-        x = x + self.attn(norm(x), mask)
+        x = x + self.attn(norm(x), mask, use_cache=use_cache)
         x = x + self.ffn(norm(x))
         return x
 
@@ -295,7 +364,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, idx: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
         B, T = idx.shape
         
         # Token embeddings
@@ -307,13 +376,85 @@ class GPT(nn.Module):
         
         # Forward through transformer layers
         for layer in self.layers:
-            x = layer(x, mask)
+            x = layer(x, mask, use_cache=use_cache)
         
         # Final norm and output projection
         x = norm(x)
         logits = self.head(x)
         
         return logits
+    
+    def init_kv_caches(self, batch_size: int, max_seq_len: int, dtype: torch.dtype = torch.bfloat16):
+        """Initialize KV caches for all attention layers"""
+        for layer in self.layers:
+            layer.attn.init_kv_cache(batch_size, max_seq_len, dtype)
+    
+    def reset_kv_caches(self):
+        """Reset all KV caches"""
+        for layer in self.layers:
+            layer.attn.reset_kv_cache()
+    
+    def disable_kv_caches(self):
+        """Disable all KV caches"""
+        for layer in self.layers:
+            layer.attn.disable_kv_cache()
+    
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, 
+                 top_k: Optional[int] = None, use_cache: bool = True) -> torch.Tensor:
+        """
+        Generate tokens using the model with optional KV caching.
+        
+        Args:
+            idx: Starting context tokens [B, T]
+            max_new_tokens: Number of tokens to generate
+            temperature: Sampling temperature
+            top_k: If specified, only sample from top k tokens
+            use_cache: Whether to use KV cache for efficient generation
+        
+        Returns:
+            Generated tokens including the initial context
+        """
+        device = idx.device
+        B, T = idx.shape
+        
+        # Initialize KV cache if requested
+        if use_cache:
+            self.init_kv_caches(B, T + max_new_tokens, dtype=idx.dtype)
+        
+        # Generate tokens
+        generated = idx
+        for _ in range(max_new_tokens):
+            # Get logits for next token
+            if use_cache and generated.shape[1] > T:
+                # Only feed the new token(s) when using cache
+                logits = self(generated[:, -1:], use_cache=True)
+            else:
+                # Feed full sequence (first iteration or no cache)
+                # Crop to context length if needed
+                idx_cond = generated if generated.shape[1] <= self.context_len else generated[:, -self.context_len:]
+                logits = self(idx_cond, use_cache=use_cache)
+            
+            # Get logits for last position
+            logits = logits[:, -1, :] / temperature
+            
+            # Optional top-k sampling
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            
+            # Sample from distribution
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # Append to generated sequence
+            generated = torch.cat((generated, idx_next), dim=1)
+        
+        # Clean up cache
+        if use_cache:
+            self.disable_kv_caches()
+        
+        return generated
 
 # ─── Reference Model for GRPO ───────────────────────────────────────────────
 class OnTheFlyNGramRef(nn.Module):
@@ -638,112 +779,6 @@ class DistributedDataGenerator:
 # ─── GRPO-Specific Components ───────────────────────────────────────────────
 # Step 3: GRPO algorithm components adapted from train.py
 
-class ContinuousBatchGenerator:
-    """
-    Continuous batch generation for efficient GPU utilization
-    Allows dynamic batching based on available memory
-    """
-    def __init__(self, model: nn.Module, context_len: int, vocab_size: int, device: str = "cuda"):
-        self.model = model
-        self.context_len = context_len
-        self.vocab_size = vocab_size
-        self.device = device
-        
-        # Maximum concurrent sequences to process
-        self.max_concurrent = 8192
-        self.kv_cache = None
-        
-    @torch.no_grad()
-    def generate_continuous_batch(self, contexts: torch.Tensor, num_samples_per_context: int, 
-                                temperature: float = 1.0, max_tokens: int = 1) -> torch.Tensor:
-        """
-        Generate samples using continuous batching for memory efficiency
-        """
-        B = contexts.shape[0]
-        total_sequences = B * num_samples_per_context
-        
-        if USE_CONTINUOUS_BATCHING and DYNAMIC_BATCH_SIZE:
-            # Calculate memory requirements
-            seq_len = contexts.shape[1] + max_tokens
-            memory_per_seq = seq_len * N_EMB * 4 * 3  # Rough estimate for KV cache
-            
-            # Get available GPU memory
-            available_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
-            max_sequences = min(total_sequences, int(available_memory * 0.95 / memory_per_seq))
-            
-            # If we can't fit all sequences, process in chunks
-            if max_sequences < total_sequences:
-                return self._generate_chunked(contexts, num_samples_per_context, temperature, 
-                                           max_tokens, max_sequences)
-        
-        # Expand contexts for all samples
-        sequences = contexts.repeat_interleave(num_samples_per_context, dim=0)
-        
-        # Track completion status
-        done = torch.zeros(total_sequences, dtype=torch.bool, device=self.device)
-        generated_tokens = torch.zeros(total_sequences, max_tokens, dtype=torch.long, device=self.device)
-        
-        # Generate tokens
-        for step in range(max_tokens):
-            active_mask = ~done
-            if not active_mask.any():
-                break
-                
-            active_sequences = sequences[active_mask]
-            
-            # Ensure we don't exceed context length
-            if active_sequences.shape[1] > self.context_len:
-                active_sequences = active_sequences[:, -self.context_len:]
-            
-            # Get model predictions
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                logits = self.model(active_sequences)[:, -1, :] / temperature
-            
-            # Sample next tokens
-            probs = F.softmax(logits, dim=-1)
-            next_tokens = torch.multinomial(probs, 1).squeeze(-1)
-            
-            # Store generated tokens
-            generated_tokens[active_mask, step] = next_tokens
-            
-            # Update sequences
-            sequences = torch.cat([
-                sequences,
-                torch.zeros(total_sequences, 1, dtype=torch.long, device=self.device)
-            ], dim=1)
-            sequences[active_mask, -1] = next_tokens
-            
-            # For single token generation, mark all as done
-            if max_tokens == 1:
-                done.fill_(True)
-        
-        # Reshape to [B, num_samples_per_context, max_tokens]
-        return generated_tokens.reshape(B, num_samples_per_context, max_tokens)
-    
-    def _generate_chunked(self, contexts: torch.Tensor, num_samples_per_context: int, 
-                         temperature: float, max_tokens: int, chunk_size: int) -> torch.Tensor:
-        """
-        Generate in chunks when memory is limited
-        """
-        B = contexts.shape[0]
-        all_generated = []
-        
-        # Process contexts in chunks
-        for i in range(0, B, chunk_size // num_samples_per_context):
-            end_idx = min(i + chunk_size // num_samples_per_context, B)
-            chunk_contexts = contexts[i:end_idx]
-            
-            # Generate for this chunk
-            chunk_generated = self.generate_continuous_batch(
-                chunk_contexts, num_samples_per_context, temperature, max_tokens
-            )
-            all_generated.append(chunk_generated)
-            
-            # Clear GPU cache to free memory
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        
-        return torch.cat(all_generated, dim=0)
 
 @torch.no_grad()
 def generate_exhaustive_single_char(model: nn.Module, contexts: torch.Tensor, vocab_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1305,12 +1340,6 @@ def train_grpo():
     kl_controller = AdaptiveKLController(target_kl=0.02)
     confidence_monitor = ConfidenceMonitor() if USE_CONFIDENCE_SCALING else None
     
-    # Initialize continuous batch generator
-    continuous_generator = None
-    if USE_CONTINUOUS_BATCHING:
-        print_rank0("Initializing continuous batch generator...", rank)
-        continuous_generator = ContinuousBatchGenerator(actor_old, CONTEXT_LEN, vocab_size, device=device)
-        print_rank0("Continuous batch generator initialized", rank)
     
     # Training state
     chars_seen = 0
@@ -1393,12 +1422,7 @@ def train_grpo():
                 # Despite the name, train_batching_optimized.py uses K-sample generation here
                 with torch.no_grad():
                     # Generate K samples using temperature sampling (NOT exhaustive)
-                    if USE_CONTINUOUS_BATCHING and continuous_generator is not None:
-                        G = continuous_generator.generate_continuous_batch(
-                            ctx, K_SAMPLES, temperature=TEMPERATURE, max_tokens=HORIZON
-                        )
-                    else:
-                        G = generate_with_temperature(actor_old, ctx, HORIZON, K_SAMPLES, vocab_size, temperature=TEMPERATURE)
+                    G = generate_with_temperature(actor_old, ctx, HORIZON, K_SAMPLES, vocab_size, temperature=TEMPERATURE)
                 
                 # Track model accuracy
                 with torch.no_grad():
@@ -1579,9 +1603,6 @@ def train_grpo():
             
             actor_old.eval()
             
-            # Update continuous generator's model reference
-            if USE_CONTINUOUS_BATCHING and continuous_generator is not None:
-                continuous_generator.model = actor_old
         
         # Save checkpoint periodically
         if it % 100 == 0:
