@@ -184,3 +184,6 @@ brainstorm/
 
 # PyPI configuration file
 .pypirc
+
+# external repos 
+nanogpt/
