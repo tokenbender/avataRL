@@ -1601,7 +1601,7 @@ def train_grpo():
             metric_tensors = {k: np.mean(v) if v else 0.0 for k, v in iter_metrics.items()}
         
         # Log to wandb (only rank 0)
-        if rank == 0 and it % 5 == 0:
+        if rank == 0 and it % 2 == 0:
             wandb.log({
                 "loss/total": total_loss * GRAD_ACCUM,
                 "loss/policy": metric_tensors.get("pol_loss", 0),
