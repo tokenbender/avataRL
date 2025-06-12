@@ -190,3 +190,6 @@ nanogpt/
 
 # macOS
 .DS_Store
+
+# bugs, features and experiment tracking
+issues/
