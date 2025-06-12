@@ -16,7 +16,7 @@ from collections import deque
 # modal configuration
 N_GPUS = 8
 GPU_TYPE = "H200"
-app = modal.App("grpo-multi-gpu")
+app = modal.App("adaptive-curriculum-learning-reward-system_1")
 
 # hyperparams
 CONTEXT_LEN = 32
@@ -1545,8 +1545,8 @@ def train_grpo():
     if rank == 0:
         import wandb
         wandb.init(
-            project="grpo-multi-gpu",
-            name=f"grpo-{N_GPUS}gpu-{N_LAYER}L-{N_EMB}D",
+            project="avataRL_11",
+            name="adaptive-curriculum-learning-reward-system_1",
             config={
                 "model": {
                     "vocab_size": vocab_size,
