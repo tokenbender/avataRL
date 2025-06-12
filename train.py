@@ -990,6 +990,175 @@ class ConfidenceMonitor:
         
         return high_conf_ratio > 0.7, high_conf_ratio
 
+class CurriculumManager:
+    """Manages curriculum learning stages and progression"""
+    def __init__(self, 
+                 n_stages: int = 4,
+                 ema_alpha: float = 0.95,
+                 promotion_threshold: float = 0.05,
+                 promotion_patience: int = 100,
+                 min_iterations_per_stage: int = 500):
+        self.n_stages = n_stages
+        self.current_stage = 1
+        self.ema_alpha = ema_alpha
+        self.promotion_threshold = promotion_threshold
+        self.promotion_patience = promotion_patience
+        self.min_iterations_per_stage = min_iterations_per_stage
+        
+        # EMA tracking for key metrics
+        self.ema_metrics = {
+            'accuracy': 0.0,
+            'reward_mean': 0.0,
+            'kl_divergence': 0.0,
+            'loss': float('inf')
+        }
+        
+        # Stage progression tracking
+        self.iterations_in_stage = 0
+        self.plateau_counter = 0
+        self.best_ema_reward = -float('inf')
+        self.stage_start_metrics = {}
+        
+        # Stage-specific configurations
+        self.stage_configs = {
+            1: {  # Character patterns
+                'name': 'Character Bigrams',
+                'ngram_weights': [0.7, 0.2, 0.1],  # bigram, trigram, fourgram
+                'reward_scale': 1.0,
+                'kl_weight': 0.05,
+                'confidence_weight': 0.3,
+                'horizon_max': 4,
+                'focus': 'Learning basic character patterns and transitions'
+            },
+            2: {  # Word formation
+                'name': 'Trigrams & Words',
+                'ngram_weights': [0.3, 0.5, 0.2],
+                'reward_scale': 1.2,
+                'kl_weight': 0.08,
+                'confidence_weight': 0.5,
+                'horizon_max': 6,
+                'focus': 'Forming valid character sequences and simple words'
+            },
+            3: {  # Lexical validity
+                'name': 'Lexical Validity',
+                'ngram_weights': [0.2, 0.4, 0.4],
+                'reward_scale': 1.5,
+                'kl_weight': 0.1,
+                'confidence_weight': 0.7,
+                'horizon_max': 8,
+                'lexical_bonus': True,
+                'focus': 'Generating valid Shakespearean words and phrases'
+            },
+            4: {  # Full optimization
+                'name': 'Full Optimization',
+                'ngram_weights': [0.15, 0.35, 0.5],
+                'reward_scale': 2.0,
+                'kl_weight': 0.1,
+                'confidence_weight': 0.7,
+                'horizon_max': 8,
+                'lexical_bonus': True,
+                'semantic_bonus': True,
+                'focus': 'Optimizing for perplexity with all features'
+            }
+        }
+        
+    def update_metrics(self, metrics: Dict[str, float]):
+        """Update EMA metrics"""
+        for key in self.ema_metrics:
+            if key in metrics:
+                if self.iterations_in_stage == 0:
+                    self.ema_metrics[key] = metrics[key]
+                else:
+                    self.ema_metrics[key] = (self.ema_alpha * self.ema_metrics[key] + 
+                                            (1 - self.ema_alpha) * metrics[key])
+        
+        self.iterations_in_stage += 1
+        
+    def check_promotion(self) -> Tuple[bool, str]:
+        """Check if ready to promote to next stage"""
+        if self.current_stage >= self.n_stages:
+            return False, "Already at final stage"
+            
+        # Check minimum iterations
+        if self.iterations_in_stage < self.min_iterations_per_stage:
+            return False, f"Need {self.min_iterations_per_stage - self.iterations_in_stage} more iterations"
+        
+        # Check for improvement plateau
+        current_reward = self.ema_metrics['reward_mean']
+        improvement = abs(current_reward - self.best_ema_reward) / (abs(self.best_ema_reward) + 1e-6)
+        
+        if improvement < self.promotion_threshold:
+            self.plateau_counter += 1
+        else:
+            self.plateau_counter = 0
+            self.best_ema_reward = current_reward
+            
+        if self.plateau_counter >= self.promotion_patience:
+            return True, f"Plateau detected: {self.plateau_counter} iterations without {self.promotion_threshold:.1%} improvement"
+            
+        # Stage-specific promotion criteria
+        stage_config = self.get_stage_config()
+        if self.current_stage == 1 and self.ema_metrics['accuracy'] > 0.3:
+            return True, "Stage 1 accuracy threshold reached (>30%)"
+        elif self.current_stage == 2 and self.ema_metrics['accuracy'] > 0.5:
+            return True, "Stage 2 accuracy threshold reached (>50%)"
+        elif self.current_stage == 3 and self.ema_metrics['accuracy'] > 0.65:
+            return True, "Stage 3 accuracy threshold reached (>65%)"
+            
+        return False, f"Continuing stage {self.current_stage}"
+        
+    def promote(self):
+        """Promote to next stage"""
+        if self.current_stage < self.n_stages:
+            # Save current stage end metrics
+            self.stage_start_metrics[self.current_stage] = self.ema_metrics.copy()
+            
+            # Move to next stage
+            self.current_stage += 1
+            self.iterations_in_stage = 0
+            self.plateau_counter = 0
+            self.best_ema_reward = self.ema_metrics['reward_mean']
+            
+            return True
+        return False
+        
+    def get_stage_config(self) -> Dict:
+        """Get current stage configuration"""
+        return self.stage_configs[self.current_stage]
+        
+    def get_reward_scale(self) -> float:
+        """Get reward scaling factor for current stage"""
+        return self.stage_configs[self.current_stage]['reward_scale']
+        
+    def get_horizon(self, base_horizon: int) -> int:
+        """Get horizon for current stage"""
+        max_horizon = self.stage_configs[self.current_stage]['horizon_max']
+        return min(base_horizon, max_horizon)
+        
+    def get_ngram_weights(self) -> List[float]:
+        """Get n-gram weights for current stage"""
+        return self.stage_configs[self.current_stage]['ngram_weights']
+        
+    def get_state_dict(self) -> Dict:
+        """Get state for checkpointing"""
+        return {
+            'current_stage': self.current_stage,
+            'iterations_in_stage': self.iterations_in_stage,
+            'ema_metrics': self.ema_metrics,
+            'plateau_counter': self.plateau_counter,
+            'best_ema_reward': self.best_ema_reward,
+            'stage_start_metrics': self.stage_start_metrics
+        }
+        
+    def load_state_dict(self, state_dict: Dict):
+        """Load state from checkpoint"""
+        self.current_stage = state_dict['current_stage']
+        self.iterations_in_stage = state_dict['iterations_in_stage']
+        self.ema_metrics = state_dict['ema_metrics']
+        self.plateau_counter = state_dict['plateau_counter']
+        self.best_ema_reward = state_dict['best_ema_reward']
+        self.stage_start_metrics = state_dict['stage_start_metrics']
+
 def compute_ppo_loss(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: torch.Tensor, 
                     clip_ratio: float = 0.5) -> torch.Tensor:
     """
@@ -1366,7 +1535,7 @@ def train_grpo():
     # Initialize controllers
     kl_controller = AdaptiveKLController(target_kl=0.02)
     confidence_monitor = ConfidenceMonitor() if USE_CONFIDENCE_SCALING else None
-    
+    curriculum_manager = CurriculumManager()
     
     # Training state
     chars_seen = 0
@@ -1600,6 +1769,25 @@ def train_grpo():
         else:
             metric_tensors = {k: np.mean(v) if v else 0.0 for k, v in iter_metrics.items()}
         
+        # Update curriculum manager with metrics
+        curriculum_metrics = {
+            'accuracy': metric_tensors.get('accuracy', 0.0),
+            'reward_mean': metric_tensors.get('reward_mean', 0.0),
+            'kl_divergence': metric_tensors.get('kl', 0.0),
+            'loss': total_loss * GRAD_ACCUM
+        }
+        curriculum_manager.update_metrics(curriculum_metrics)
+        
+        # Check for curriculum promotion
+        should_promote, promotion_reason = curriculum_manager.check_promotion()
+        if should_promote:
+            curriculum_manager.promote()
+            stage_config = curriculum_manager.get_stage_config()
+            if rank == 0:
+                print(f"\n[Curriculum] Promoted to Stage {curriculum_manager.current_stage}: {stage_config['name']}")
+                print(f"[Curriculum] Reason: {promotion_reason}")
+                print(f"[Curriculum] Focus: {stage_config['focus']}")
+        
         # Log to wandb (only rank 0)
         if rank == 0 and it % 2 == 0:
             wandb.log({
@@ -1617,6 +1805,11 @@ def train_grpo():
                 "training/chars_seen": chars_seen,
                 "training/iteration": it,
                 "training/epoch": it / ITERS_PER_EPOCH,
+                "curriculum/stage": curriculum_manager.current_stage,
+                "curriculum/iterations_in_stage": curriculum_manager.iterations_in_stage,
+                "curriculum/ema_accuracy": curriculum_manager.ema_metrics['accuracy'],
+                "curriculum/ema_reward": curriculum_manager.ema_metrics['reward_mean'],
+                "curriculum/plateau_counter": curriculum_manager.plateau_counter,
             })
         
         # Update old_actor periodically
@@ -1647,6 +1840,7 @@ def train_grpo():
                     "chars_seen": chars_seen,
                     "kl_coef": current_kl_coef,
                     "scaler_state": scaler.state_dict(),
+                    "curriculum_state": curriculum_manager.get_state_dict(),
                 }
             )
         
