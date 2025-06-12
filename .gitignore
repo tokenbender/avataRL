@@ -187,3 +187,6 @@ brainstorm/
 
 # external repos 
 nanogpt/
+
+# macOS
+.DS_Store
