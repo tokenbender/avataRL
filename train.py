@@ -20,7 +20,7 @@ app = modal.App("adaptive-curriculum-learning-reward-system_2")
 
 # hyperparams
 CONTEXT_LEN = 32
-HORIZON = 1
+HORIZON = 8
 BATCH = 16384
 MICRO_BATCH = 256
 GRAD_ACCUM = BATCH // (MICRO_BATCH * N_GPUS)
@@ -898,13 +898,82 @@ def compute_exhaustive_rewards(all_chars: torch.Tensor, ref_char: torch.Tensor, 
     
     return rewards
 
+def calculate_repetition_penalty(tokens: torch.Tensor, window_size: int = 16, 
+                               ngram_weights: Dict[int, float] = None,
+                               device: str = 'cuda') -> torch.Tensor:
+    """
+    Calculate repetition penalty for generated sequences using n-gram detection
+    
+    Args:
+        tokens: [B, T] generated token sequences
+        window_size: size of sliding window for repetition detection
+        ngram_weights: weights for different n-gram levels (default: {1: 0.4, 2: 0.3, 3: 0.2, 4: 0.1})
+        device: device for computation
+    
+    Returns:
+        penalty: [B] repetition penalty per sequence (0-1, higher = more repetition)
+    """
+    if ngram_weights is None:
+        ngram_weights = {1: 0.4, 2: 0.3, 3: 0.2, 4: 0.1}
+    
+    B, T = tokens.shape
+    penalties = torch.zeros(B, device=device)
+    
+    # For each n-gram level
+    for n in range(1, min(5, T + 1)):  # Check 1-grams to 4-grams
+        if n not in ngram_weights or ngram_weights[n] == 0:
+            continue
+            
+        ngram_penalties = torch.zeros(B, device=device)
+        
+        # Process each sequence
+        for b in range(B):
+            seq = tokens[b]
+            
+            # Use sliding window
+            for start in range(max(0, T - window_size)):
+                end = min(T, start + window_size)
+                window = seq[start:end]
+                
+                if len(window) < n:
+                    continue
+                
+                # Count n-gram occurrences in window
+                ngram_counts = {}
+                for i in range(len(window) - n + 1):
+                    ngram = tuple(window[i:i+n].tolist())
+                    ngram_counts[ngram] = ngram_counts.get(ngram, 0) + 1
+                
+                # Calculate penalties for this window
+                window_penalty = 0.0
+                for ngram, count in ngram_counts.items():
+                    if count > 1:
+                        # Exponential penalty for repeated n-grams
+                        if count == 2:
+                            penalty = 0.1
+                        else:
+                            penalty = 1.0 - math.exp(-0.5 * (count - 1))
+                        window_penalty += penalty
+                
+                # Normalize by number of possible n-grams
+                num_ngrams = len(window) - n + 1
+                if num_ngrams > 0:
+                    window_penalty /= num_ngrams
+                
+                ngram_penalties[b] = max(ngram_penalties[b], window_penalty)
+        
+        # Add weighted n-gram penalties
+        penalties += ngram_weights[n] * ngram_penalties
+    
+    return penalties.clamp(0.0, 1.0)
+
 def compute_rewards_multi_char(gen: torch.Tensor, ref: torch.Tensor, ref_logits: torch.Tensor, 
                              curriculum_manager: Optional['CurriculumManager'] = None,
                              sequences: Optional[torch.Tensor] = None,
                              ngram_scores: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
     """
     Compute rewards for multi-character generation with detailed metrics
-    Matches train_batching_optimized.py implementation
+    Includes advanced repetition penalty for stage 2+
     """
     # Exact match reward
     exact_match = (gen == ref).float()
@@ -921,6 +990,24 @@ def compute_rewards_multi_char(gen: torch.Tensor, ref: torch.Tensor, ref_logits:
     # Base reward
     base_reward = exact_match + partial_reward
     
+    # Calculate repetition penalty using n-gram detection
+    repetition_penalties = torch.zeros(B, device=gen.device)
+    if curriculum_manager is not None and curriculum_manager.current_stage >= 2:
+        # Calculate n-gram based repetition penalties
+        repetition_penalties = calculate_repetition_penalty(
+            gen, 
+            window_size=16,
+            device=gen.device
+        )
+        
+        # Get stage-specific penalty weight
+        penalty_weight = curriculum_manager.get_repetition_penalty_weight()
+        
+        # Apply penalty as multiplicative factor on rewards
+        # Expand penalties to match reward shape [B, T]
+        rep_penalty_expanded = repetition_penalties.unsqueeze(1).expand_as(base_reward)
+        base_reward = base_reward * (1.0 - penalty_weight * rep_penalty_expanded)
+    
     # Apply curriculum adjustments if available
     if curriculum_manager is not None and sequences is not None and ngram_scores is not None:
         reward = curriculum_manager.compute_curriculum_rewards(base_reward.mean(dim=1), ngram_scores, sequences)
@@ -928,11 +1015,26 @@ def compute_rewards_multi_char(gen: torch.Tensor, ref: torch.Tensor, ref_logits:
     else:
         reward = base_reward
     
+    # Track repetition statistics
+    repetition_stats = {
+        "repetition_penalty_mean": repetition_penalties.mean().item(),
+        "repetition_penalty_max": repetition_penalties.max().item(),
+        "repetition_penalty_std": repetition_penalties.std().item() if B > 1 else 0.0,
+    }
+    
+    # Calculate immediate repetition rate for backward compatibility
+    repetition_rate = 0.0
+    if T > 1:
+        immediate_reps = (gen[:, 1:] == gen[:, :-1]).float().mean().item()
+        repetition_rate = immediate_reps
+    
     metrics = {
         "accuracy": exact_match.mean().item(),
         "avg_gen_prob": gen_probs.mean().item(),
         "reward_mean": reward.mean().item(),
         "reward_std": reward.std().item(),
+        "repetition_rate": repetition_rate,
+        **repetition_stats
     }
     
     return reward, metrics
@@ -1063,14 +1165,22 @@ class CurriculumManager:
                  ema_alpha: float = 0.95,
                  promotion_threshold: float = 0.05,
                  promotion_patience: int = 100,
-                 min_iterations_per_stage: int = 500):
+                 min_iterations_per_stage: int = 500,
+                 total_iterations: Optional[int] = None):
         self.device = device
         self.vocab_size = vocab_size
         self.current_stage = 0  # Start from stage 0
         self.ema_alpha = ema_alpha
         self.promotion_threshold = promotion_threshold
-        self.promotion_patience = promotion_patience
-        self.min_iterations_per_stage = min_iterations_per_stage
+        
+        # Calculate parameters based on total iterations if provided
+        if total_iterations is not None:
+            # 5 stages total, so divide iterations evenly with some buffer
+            self.min_iterations_per_stage = max(1, total_iterations // 10)  # Allow promotion after 10% of stage time
+            self.promotion_patience = max(1, total_iterations // 20)  # Wait for 5% of total time before promotion
+        else:
+            self.promotion_patience = promotion_patience
+            self.min_iterations_per_stage = min_iterations_per_stage
         
         # EMA tracking for key metrics
         self.ema_metrics = {
@@ -1101,6 +1211,15 @@ class CurriculumManager:
         
         # Number of stages
         self.n_stages = 5  # stages 0-4 (5 total stages)
+        
+        # Repetition penalty configuration
+        self.repetition_penalty_weights = {
+            0: 0.0,   # Stage 0: No penalty (learning basics)
+            1: 0.0,   # Stage 1: No penalty (simple words)
+            2: 0.1,   # Stage 2: Mild penalty
+            3: 0.2,   # Stage 3: Moderate penalty
+            4: 0.3,   # Stage 4: Strong penalty
+        }
         
     def _compile_stage_configs(self):
         """Pre-compile all stage configurations as tensors"""
@@ -1280,6 +1399,10 @@ class CurriculumManager:
                     word_counts[b, length-2] = (word_lengths == length).sum()
         
         return word_counts
+    
+    def get_repetition_penalty_weight(self) -> float:
+        """Get repetition penalty weight for current stage"""
+        return self.repetition_penalty_weights.get(self.current_stage, 0.0)
     
     def compute_curriculum_rewards(self, base_rewards: torch.Tensor,
                                  ngram_scores: torch.Tensor,
@@ -1689,7 +1812,7 @@ def train_grpo():
     # Initialize controllers
     kl_controller = AdaptiveKLController(target_kl=0.02)
     confidence_monitor = ConfidenceMonitor() if USE_CONFIDENCE_SCALING else None
-    curriculum_manager = CurriculumManager(device=device, vocab_size=vocab_size)
+    curriculum_manager = CurriculumManager(device=device, vocab_size=vocab_size, total_iterations=TOTAL_ITERS)
     
     # Training state
     chars_seen = 0
@@ -1768,8 +1891,8 @@ def train_grpo():
                     old_logits = actor_old(ctx[:, -actor_old.module.context_len if hasattr(actor_old, 'module') else -actor_old.context_len:])[:, -1, :]
                     old_probs = F.softmax(old_logits, dim=-1)
             
-            if USE_EXHAUSTIVE and HORIZON == 1:
-                # Despite the name, train_batching_optimized.py uses K-sample generation here
+            if USE_EXHAUSTIVE:
+                # Generate K samples for multi-token horizon
                 with torch.no_grad():
                     # Generate K samples using temperature sampling (NOT exhaustive)
                     G = generate_with_temperature(actor_old, ctx, HORIZON, K_SAMPLES, vocab_size, temperature=TEMPERATURE)
@@ -1894,11 +2017,12 @@ def train_grpo():
                 if kl_controller and micro_step == 0:
                     current_kl_coef = kl_controller.update(kl.item(), current_kl_coef)
                 
-                # Entropy bonus (matching train_batching_optimized.py) - removed since not actually used
-                # Note: train_batching_optimized.py doesn't include entropy in the loss despite having ENTROPY_COEF
+                # Entropy bonus - encourages exploration
+                entropy = new_dist.entropy().mean()
+                entropy_bonus = 0.01  # Fixed entropy coefficient as specified
                 
-                # Total loss (matching train_batching_optimized.py)
-                loss = (pol_loss + current_kl_coef * kl) / GRAD_ACCUM
+                # Total loss with entropy bonus
+                loss = (pol_loss + current_kl_coef * kl - entropy_bonus * entropy) / GRAD_ACCUM
             
             # Backward pass
             scaler.scale(loss).backward()
@@ -1907,6 +2031,7 @@ def train_grpo():
             # Store metrics
             iter_metrics["pol_loss"].append(pol_loss.item())
             iter_metrics["kl"].append(kl.item())
+            iter_metrics["entropy"].append(entropy.item())
             iter_metrics["ratio"].append(ratio.mean().item())
             iter_metrics["ratio_max"].append(ratio.max().item())
             
@@ -1962,6 +2087,7 @@ def train_grpo():
                 "loss/total": total_loss * GRAD_ACCUM,
                 "loss/policy": metric_tensors.get("pol_loss", 0),
                 "loss/kl": metric_tensors.get("kl", 0),
+                "loss/entropy": metric_tensors.get("entropy", 0),
                 "loss/kl_coef": current_kl_coef,
                 "metrics/accuracy": metric_tensors.get("accuracy", 0),
                 "metrics/reward_mean": metric_tensors.get("reward_mean", 0),
@@ -1969,6 +2095,8 @@ def train_grpo():
                 "metrics/advantage_std": metric_tensors.get("advantage_std", 0),
                 "metrics/ratio_mean": metric_tensors.get("ratio", 1.0),
                 "metrics/ratio_max": metric_tensors.get("ratio_max", 1.0),
+                "metrics/repetition_rate": metric_tensors.get("repetition_rate", 0.0),
+                "metrics/repetition_penalty_mean": metric_tensors.get("repetition_penalty_mean", 0.0),
                 "training/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                 "training/chars_seen": chars_seen,
                 "training/iteration": it,
