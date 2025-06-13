@@ -16,7 +16,7 @@ from collections import deque
 # modal configuration
 N_GPUS = 8
 GPU_TYPE = "H200"
-app = modal.App("adaptive-curriculum-learning-reward-system_1")
+app = modal.App("adaptive-curriculum-learning-reward-system_2")
 
 # hyperparams
 CONTEXT_LEN = 32
@@ -898,7 +898,10 @@ def compute_exhaustive_rewards(all_chars: torch.Tensor, ref_char: torch.Tensor, 
     
     return rewards
 
-def compute_rewards_multi_char(gen: torch.Tensor, ref: torch.Tensor, ref_logits: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+def compute_rewards_multi_char(gen: torch.Tensor, ref: torch.Tensor, ref_logits: torch.Tensor, 
+                             curriculum_manager: Optional['CurriculumManager'] = None,
+                             sequences: Optional[torch.Tensor] = None,
+                             ngram_scores: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
     """
     Compute rewards for multi-character generation with detailed metrics
     Matches train_batching_optimized.py implementation
@@ -915,8 +918,15 @@ def compute_rewards_multi_char(gen: torch.Tensor, ref: torch.Tensor, ref_logits:
         # Partial reward from reference model
         partial_reward = gen_probs
     
-    # Combined reward (matching train_batching_optimized.py)
-    reward = exact_match + partial_reward
+    # Base reward
+    base_reward = exact_match + partial_reward
+    
+    # Apply curriculum adjustments if available
+    if curriculum_manager is not None and sequences is not None and ngram_scores is not None:
+        reward = curriculum_manager.compute_curriculum_rewards(base_reward.mean(dim=1), ngram_scores, sequences)
+        reward = reward.unsqueeze(-1).expand_as(base_reward)
+    else:
+        reward = base_reward
     
     metrics = {
         "accuracy": exact_match.mean().item(),
@@ -990,16 +1000,73 @@ class ConfidenceMonitor:
         
         return high_conf_ratio > 0.7, high_conf_ratio
 
+class CharacterDifficultyAnalyzer:
+    """Analyzes character-level difficulty metrics for curriculum learning"""
+    def __init__(self, text: str, stoi: Dict[str, int], vocab_size: int, device: torch.device):
+        self.vocab_size = vocab_size
+        self.device = device
+        
+        text_indices = torch.tensor([stoi[c] for c in text], dtype=torch.long, device=device)
+        
+        self.char_counts = torch.zeros(vocab_size, device=device)
+        self.char_counts.index_add_(0, text_indices, torch.ones_like(text_indices, dtype=torch.float32))
+        self.char_freq = self.char_counts / self.char_counts.sum()
+        
+        self.rare_threshold = torch.quantile(self.char_freq, 0.2)
+        self.is_rare_char = self.char_freq < self.rare_threshold
+        
+        bigram_counts = torch.zeros(vocab_size, vocab_size, device=device, dtype=torch.float32)
+        if len(text_indices) > 1:
+            text_indices_shifted = text_indices[1:]
+            text_indices_base = text_indices[:-1]
+            
+            indices = torch.stack([text_indices_base, text_indices_shifted], dim=0)
+            bigram_counts.index_put_(tuple(indices), 
+                                    torch.ones(len(text)-1, device=device), 
+                                    accumulate=True)
+        
+        row_sums = bigram_counts.sum(dim=1, keepdim=True)
+        self.bigram_probs = bigram_counts / (row_sums + 1e-8)
+        
+        self.log_char_freq = torch.log(self.char_freq + 1e-8)
+        self.char_entropy = -torch.sum(self.char_freq * self.log_char_freq)
+        
+        self.use_trigrams = False
+    
+    def compute_batch_difficulty(self, sequences: torch.Tensor) -> torch.Tensor:
+        """Compute difficulty scores for a batch of sequences"""
+        B, T = sequences.shape
+        
+        char_freqs = self.char_freq[sequences]
+        rare_mask = self.is_rare_char[sequences]
+        
+        char_freq_scores = char_freqs.mean(dim=1)
+        rare_ratios = rare_mask.float().mean(dim=1)
+        
+        if T > 1:
+            seq_flat = sequences.view(-1)
+            idx1 = seq_flat[:-B].view(B, T-1)
+            idx2 = seq_flat[B:].view(B, T-1)
+            
+            bigram_probs = self.bigram_probs[idx1, idx2]
+            bigram_scores = bigram_probs.mean(dim=1)
+        else:
+            bigram_scores = torch.zeros(B, device=sequences.device)
+        
+        return (1.0 - (0.4 * char_freq_scores + 
+                      0.4 * bigram_scores + 
+                      0.2 * (1.0 - rare_ratios))).clamp(0.0, 1.0)
+
 class CurriculumManager:
-    """Manages curriculum learning stages and progression"""
-    def __init__(self, 
-                 n_stages: int = 4,
+    """Manages curriculum learning stages and progression with word-based rewards"""
+    def __init__(self, device: torch.device, vocab_size: int = 65,
                  ema_alpha: float = 0.95,
                  promotion_threshold: float = 0.05,
                  promotion_patience: int = 100,
                  min_iterations_per_stage: int = 500):
-        self.n_stages = n_stages
-        self.current_stage = 1
+        self.device = device
+        self.vocab_size = vocab_size
+        self.current_stage = 0  # Start from stage 0
         self.ema_alpha = ema_alpha
         self.promotion_threshold = promotion_threshold
         self.promotion_patience = promotion_patience
@@ -1019,48 +1086,82 @@ class CurriculumManager:
         self.best_ema_reward = -float('inf')
         self.stage_start_metrics = {}
         
-        # Stage-specific configurations
+        # Pre-compute boundary mask for word detection
+        boundary_chars = " .,!?:;\n'-\""
+        self.boundary_mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        for char in boundary_chars:
+            if ord(char) < vocab_size:
+                self.boundary_mask[ord(char)] = True
+        
+        # Pre-compile stage configurations
+        self._compile_stage_configs()
+        
+        # Pre-allocate buffers
+        self.word_count_buffer = torch.zeros(256, 5, device=device)
+        
+        # Number of stages
+        self.n_stages = 5  # stages 0-4 (5 total stages)
+        
+    def _compile_stage_configs(self):
+        """Pre-compile all stage configurations as tensors"""
         self.stage_configs = {
-            1: {  # Character patterns
-                'name': 'Character Bigrams',
-                'ngram_weights': [0.7, 0.2, 0.1],  # bigram, trigram, fourgram
+            0: {  # Stage 0: Bigram Foundation
+                'name': 'Bigram Foundation',
+                'ngram_weights': torch.tensor([1.0, 0.0, 0.0], device=self.device),
+                'word_weights': torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0], device=self.device),
+                'reward_scale': 1.0,
+                'kl_weight': 0.03,
+                'confidence_weight': 0.2,
+                'horizon_max': 8,
+                'focus': 'Learn character transitions only'
+            },
+            1: {  # Stage 1: 2-3 Letter Words
+                'name': '2-3 Letter Words',
+                'ngram_weights': torch.tensor([0.5, 0.0, 0.0], device=self.device),
+                'word_weights': torch.tensor([0.1, 0.27, 0.0, 0.0, 0.0], device=self.device),
                 'reward_scale': 1.0,
                 'kl_weight': 0.05,
                 'confidence_weight': 0.3,
-                'horizon_max': 4,
-                'focus': 'Learning basic character patterns and transitions'
+                'horizon_max': 8,
+                'focus': 'Learn simple 2-3 letter words while maintaining bigram patterns'
             },
-            2: {  # Word formation
-                'name': 'Trigrams & Words',
-                'ngram_weights': [0.3, 0.5, 0.2],
+            2: {  # Stage 2: 2-4 Letter Words + Fourgrams
+                'name': '2-4 Letter Words + Fourgrams',
+                'ngram_weights': torch.tensor([0.25, 0.0, 0.25], device=self.device),
+                'word_weights': torch.tensor([0.06, 0.16, 0.28, 0.0, 0.0], device=self.device),
                 'reward_scale': 1.2,
                 'kl_weight': 0.08,
                 'confidence_weight': 0.5,
-                'horizon_max': 6,
-                'focus': 'Forming valid character sequences and simple words'
+                'horizon_max': 8,
+                'focus': 'Equal emphasis on patterns and word formation'
             },
-            3: {  # Lexical validity
-                'name': 'Lexical Validity',
-                'ngram_weights': [0.2, 0.4, 0.4],
+            3: {  # Stage 3: Full Word Spectrum
+                'name': 'Full Word Spectrum',
+                'ngram_weights': torch.tensor([0.17, 0.17, 0.16], device=self.device),
+                'word_weights': torch.tensor([0.15, 0.41, 0.73, 0.21, 0.0], device=self.device),
                 'reward_scale': 1.5,
                 'kl_weight': 0.1,
                 'confidence_weight': 0.7,
                 'horizon_max': 8,
-                'lexical_bonus': True,
-                'focus': 'Generating valid Shakespearean words and phrases'
+                'focus': 'Prioritize word formation and vocabulary expansion'
             },
-            4: {  # Full optimization
+            4: {  # Stage 4: Full Optimization
                 'name': 'Full Optimization',
-                'ngram_weights': [0.15, 0.35, 0.5],
+                'ngram_weights': torch.tensor([0.15, 0.20, 0.15], device=self.device),
+                'word_weights': torch.tensor([0.1, 0.27, 0.48, 1.35, 3.5], device=self.device),
                 'reward_scale': 2.0,
                 'kl_weight': 0.1,
                 'confidence_weight': 0.7,
                 'horizon_max': 8,
-                'lexical_bonus': True,
-                'semantic_bonus': True,
-                'focus': 'Optimizing for perplexity with all features'
+                'focus': 'Heavy emphasis on complete words and semantic coherence'
             }
         }
+        
+        # Pre-compute weight sums for normalization
+        for stage, config in self.stage_configs.items():
+            config['ngram_sum'] = config['ngram_weights'].sum().item()
+            config['word_sum'] = config['word_weights'].sum().item()
+            config['total_sum'] = config['ngram_sum'] + config['word_sum']
         
     def update_metrics(self, metrics: Dict[str, float]):
         """Update EMA metrics"""
@@ -1076,7 +1177,7 @@ class CurriculumManager:
         
     def check_promotion(self) -> Tuple[bool, str]:
         """Check if ready to promote to next stage"""
-        if self.current_stage >= self.n_stages:
+        if self.current_stage >= self.n_stages - 1:
             return False, "Already at final stage"
             
         # Check minimum iterations
@@ -1109,7 +1210,7 @@ class CurriculumManager:
         
     def promote(self):
         """Promote to next stage"""
-        if self.current_stage < self.n_stages:
+        if self.current_stage < self.n_stages - 1:
             # Save current stage end metrics
             self.stage_start_metrics[self.current_stage] = self.ema_metrics.copy()
             
@@ -1158,6 +1259,56 @@ class CurriculumManager:
         self.plateau_counter = state_dict['plateau_counter']
         self.best_ema_reward = state_dict['best_ema_reward']
         self.stage_start_metrics = state_dict['stage_start_metrics']
+    
+    def detect_words_gpu(self, sequences: torch.Tensor) -> torch.Tensor:
+        """GPU-native word detection"""
+        B, T = sequences.shape
+        
+        is_boundary = self.boundary_mask[sequences]
+        
+        is_boundary[:, 0] = True
+        if T > 1:
+            is_boundary[:, -1] = True
+        
+        word_counts = self.word_count_buffer[:B, :].zero_()
+        
+        for b in range(B):
+            boundaries = torch.where(is_boundary[b])[0]
+            if len(boundaries) > 1:
+                word_lengths = boundaries[1:] - boundaries[:-1]
+                for length in range(2, 7):
+                    word_counts[b, length-2] = (word_lengths == length).sum()
+        
+        return word_counts
+    
+    def compute_curriculum_rewards(self, base_rewards: torch.Tensor,
+                                 ngram_scores: torch.Tensor,
+                                 sequences: torch.Tensor) -> torch.Tensor:
+        """Compute combined n-gram and word rewards"""
+        word_counts = self.detect_words_gpu(sequences)
+        
+        stage_config = self.get_stage_config()
+        ngram_weights = stage_config['ngram_weights']
+        word_weights = stage_config['word_weights']
+        
+        ngram_reward = (ngram_scores * ngram_weights).sum(dim=1)
+        word_reward = (word_counts * word_weights).sum(dim=1)
+        
+        ngram_sum = stage_config['ngram_sum']
+        word_sum = stage_config['word_sum']
+        
+        if ngram_sum > 0:
+            ngram_reward /= ngram_sum
+        if word_sum > 0:
+            word_reward /= word_sum
+        
+        if word_sum == 0:
+            combined_reward = ngram_reward
+        else:
+            total = stage_config['total_sum']
+            combined_reward = (ngram_sum / total) * ngram_reward + (word_sum / total) * word_reward
+        
+        return base_rewards + stage_config['reward_scale'] * combined_reward
 
 def compute_ppo_loss(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: torch.Tensor, 
                     clip_ratio: float = 0.5) -> torch.Tensor:
@@ -1471,6 +1622,9 @@ def train_grpo():
     print_rank0(f"Total batch size: {BATCH} samples", rank)
     print_rank0(f"Effective batch per GPU: {MICRO_BATCH * GRAD_ACCUM} samples", rank)
     
+    # Initialize character difficulty analyzer
+    character_analyzer = CharacterDifficultyAnalyzer(text, stoi, vocab_size, device)
+    
     # Initialize models
     ref_model = OnTheFlyNGramRef(text, stoi, vocab_size).to(device).eval()
     
@@ -1535,7 +1689,7 @@ def train_grpo():
     # Initialize controllers
     kl_controller = AdaptiveKLController(target_kl=0.02)
     confidence_monitor = ConfidenceMonitor() if USE_CONFIDENCE_SCALING else None
-    curriculum_manager = CurriculumManager()
+    curriculum_manager = CurriculumManager(device=device, vocab_size=vocab_size)
     
     # Training state
     chars_seen = 0
@@ -1546,7 +1700,7 @@ def train_grpo():
         import wandb
         wandb.init(
             project="avataRL_11",
-            name="adaptive-curriculum-learning-reward-system_1",
+            name="adaptive-curriculum-learning-reward-system_2",
             config={
                 "model": {
                     "vocab_size": vocab_size,
@@ -1649,6 +1803,7 @@ def train_grpo():
                         iter_metrics["fourgram_accuracy"].append(fourgram_correct)
                 
                 # Compute rewards for each sample
+                B = ctx.shape[0]  # Get batch size
                 R = torch.zeros_like(G, dtype=torch.float32)
                 
                 for k in range(K_SAMPLES):
@@ -1658,7 +1813,20 @@ def train_grpo():
                         full_seq = torch.cat([ctx, gen], dim=1)
                         ref_logits = ref_model(full_seq[:, -HORIZON-1:])[:, -HORIZON:]
                     
-                    reward, metrics = compute_rewards_multi_char(gen, ref_tok, ref_logits)
+                    # Prepare n-gram scores for curriculum
+                    if micro_step == 0 and k == 0:
+                        with torch.no_grad():
+                            ref_full = torch.cat([ctx, ref_tok], dim=1)
+                            _, components = ref_model(ref_full[:, -HORIZON-1:], return_components=True)
+                            
+                            bigram_acc = (components['bigram'][:, -1, :].argmax(dim=-1) == ref_tok[:, 0]).float().mean()
+                            trigram_acc = (components['trigram'][:, -1, :].argmax(dim=-1) == ref_tok[:, 0]).float().mean() if CONTEXT_LEN >= 2 else torch.tensor(0.0)
+                            fourgram_acc = (components['fourgram'][:, -1, :].argmax(dim=-1) == ref_tok[:, 0]).float().mean() if CONTEXT_LEN >= 3 else torch.tensor(0.0)
+                            
+                            ngram_scores = torch.stack([bigram_acc, trigram_acc, fourgram_acc]).unsqueeze(0).expand(B, -1)
+                    
+                    reward, metrics = compute_rewards_multi_char(gen, ref_tok, ref_logits,
+                                                                curriculum_manager, ctx, ngram_scores)
                     R[:, k, :] = reward
                     
                     # Store metrics from reward computation

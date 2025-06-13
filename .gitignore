@@ -193,3 +193,6 @@ nanogpt/
 
 # bugs, features and experiment tracking
 issues/
+
+# documentation
+docs/
