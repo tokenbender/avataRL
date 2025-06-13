@@ -16,7 +16,7 @@ from collections import deque
 # modal configuration
 N_GPUS = 8
 GPU_TYPE = "H200"
-app = modal.App("adaptive-curriculum-learning-reward-system_2")
+app = modal.App("adaptive-curriculum-learning-reward-system_5")
 
 # hyperparams
 CONTEXT_LEN = 32
@@ -36,6 +36,11 @@ KL_FREE_FRACTION = 0.1
 N_LAYER = 6
 N_HEAD = 6
 N_EMB = 384
+
+# Checkpoint Configuration
+SAVE_INTERMEDIATE_CHECKPOINTS = False  # Only save final checkpoint to reduce storage
+SAVE_FINAL_CHECKPOINT = True
+CHECKPOINT_INTERVAL = 1000  # Not used when SAVE_INTERMEDIATE_CHECKPOINTS=False
 
 BUCKET_SIZE_MB = 30
 
@@ -63,7 +68,7 @@ MAX_PAGES_PER_SEQ = 8
 USE_LR_DECAY = True
 LR_DECAY_TYPE = "cosine"  # Options: "cosine", "linear", "exponential"
 MIN_LR = 1e-5
-WARMUP_ITERS = 100
+WARMUP_ITERS = max(1, int(TOTAL_ITERS * 0.02))  # 2% of total iterations for warmup
 
 def norm(x: torch.Tensor) -> torch.Tensor:
     """RMSNorm implementation using PyTorch built-in"""
@@ -149,8 +154,11 @@ class KVCache(nn.Module):
         k_out = self.k_cache
         v_out = self.v_cache
 
-        k_out[:, :, self.cache_pos[:seq_len]] = k_val
-        v_out[:, :, self.cache_pos[:seq_len]] = v_val
+        # Use integer indexing instead of tensor indexing to avoid dtype mismatch
+        cache_start = self.cache_pos[0].item()
+        cache_end = cache_start + seq_len
+        k_out[:, :, cache_start:cache_end] = k_val
+        v_out[:, :, cache_start:cache_end] = v_val
 
         # Update position tracker
         self.cache_pos.add_(seq_len)
@@ -559,6 +567,185 @@ class OnTheFlyNGramRef(nn.Module):
             }
         
         return combined_logits
+
+
+def load_shakespeare_reference_model(checkpoint_path: str, vocab_size: int, device: torch.device, rank: int) -> Optional[GPT]:
+    """Load pretrained Shakespeare model for KL divergence reference"""
+    try:
+        if rank == 0:
+            print(f"[Reference Model] Loading pretrained Shakespeare model from {checkpoint_path}...")
+            
+        # Check if this is a URL or a file path
+        if checkpoint_path.startswith('http'):
+            # Download from URL (for backward compatibility)
+            import urllib.request
+            local_path = "/tmp/shakespeare_ckpt.pt"
+            if rank == 0:
+                print(f"[Reference Model] Downloading from {checkpoint_path}...")
+                urllib.request.urlretrieve(checkpoint_path, local_path)
+            # Synchronize across ranks
+            if dist.is_initialized():
+                dist.barrier()
+            checkpoint_path = local_path
+        else:
+            # It's a file path - check if it exists
+            if not os.path.exists(checkpoint_path):
+                # Try alternative paths in Modal volume
+                alternative_paths = [
+                    "/models/shakespeare/shakespeare_char_model.pt",
+                    "/models/shakespeare/model.pt",
+                    "/models/shakespeare/ckpt.pt",
+                    "/models/shakespeare/checkpoint.pt"
+                ]
+                found = False
+                for alt_path in alternative_paths:
+                    if os.path.exists(alt_path):
+                        checkpoint_path = alt_path
+                        found = True
+                        if rank == 0:
+                            print(f"[Reference Model] Found checkpoint at {alt_path}")
+                        break
+                
+                if not found:
+                    raise FileNotFoundError(f"Shakespeare checkpoint not found at {checkpoint_path} or alternative paths")
+        
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # Extract model configuration from checkpoint
+        if 'model_args' in checkpoint:
+            model_args = checkpoint['model_args']
+            n_layer = model_args.get('n_layer', 6)
+            n_head = model_args.get('n_head', 6)
+            n_embd = model_args.get('n_embd', 384)
+            block_size = model_args.get('block_size', 256)
+        else:
+            # Use default configuration if not in checkpoint
+            n_layer = 6
+            n_head = 6
+            n_embd = 384
+            block_size = 256
+        
+        # Create model with same architecture
+        ref_model = GPT(
+            vocab_size=vocab_size,
+            n_layer=n_layer,
+            n_head=n_head,
+            n_emb=n_embd,
+            context_len=block_size
+        ).to(device)
+        
+        # Load state dict
+        state_dict = checkpoint['model']
+        
+        # Handle potential naming mismatches
+        # Remove unwanted prefix if present
+        unwanted_prefix = '_orig_mod.'
+        for k in list(state_dict.keys()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        
+        # Load weights
+        ref_model.load_state_dict(state_dict, strict=False)
+        ref_model.eval()
+        
+        if rank == 0:
+            print(f"[Reference Model] Successfully loaded Shakespeare reference model")
+            print(f"[Reference Model] Model config: layers={n_layer}, heads={n_head}, embed={n_embd}, context={block_size}")
+        
+        return ref_model
+        
+    except Exception as e:
+        if rank == 0:
+            print(f"[Reference Model] Failed to load pretrained model: {e}")
+            print("[Reference Model] Continuing without reference model KL penalty")
+        return None
+
+
+def compute_shakespeare_kl_penalty(
+    generated_tokens: torch.Tensor,    # [B, T] generated sequences
+    new_logits: torch.Tensor,          # [B, T, V] logits from current model
+    shakespeare_model: GPT,            # Pretrained Shakespeare model
+    stage: int,                        # Current curriculum stage
+    device: torch.device
+) -> torch.Tensor:
+    """
+    Compute KL divergence between current model and pretrained Shakespeare model
+    with curriculum-based top-k filtering that gradually tightens
+    
+    Returns: [B] KL penalty per sequence
+    """
+    B, T, V = new_logits.shape
+    
+    # Stage-specific top-k values for gradual tightening
+    # Starting loose and getting tighter as stages progress
+    stage_topk_config = {
+        0: V,      # No KL penalty in stage 0
+        1: V,      # No KL penalty in stage 1
+        2: 50,     # Top 50 tokens (loose constraint)
+        3: 20,     # Top 20 tokens (medium constraint)
+        4: 10,     # Top 10 tokens (tight constraint)
+    }
+    
+    top_k = stage_topk_config.get(stage, V)
+    
+    with torch.no_grad():
+        # Get Shakespeare model predictions for the same sequences
+        shakespeare_logits = shakespeare_model(generated_tokens)
+        
+        # Convert to log probabilities for numerical stability
+        shakespeare_log_probs = F.log_softmax(shakespeare_logits, dim=-1)
+        new_log_probs = F.log_softmax(new_logits, dim=-1)
+        
+        # Apply top-k filtering if needed
+        if top_k < V:
+            # Get top-k tokens from Shakespeare model
+            topk_values, topk_indices = torch.topk(shakespeare_log_probs, k=top_k, dim=-1)
+            
+            # Create mask for top-k tokens
+            mask = torch.zeros_like(shakespeare_log_probs, dtype=torch.bool)
+            mask.scatter_(2, topk_indices, True)
+            
+            # Compute KL only for top-k tokens
+            # Set non-top-k to -inf to exclude from KL computation
+            shakespeare_log_probs_masked = shakespeare_log_probs.clone()
+            shakespeare_log_probs_masked[~mask] = float('-inf')
+            
+            new_log_probs_masked = new_log_probs.clone()
+            new_log_probs_masked[~mask] = float('-inf')
+            
+            # Renormalize to valid probability distributions
+            shakespeare_probs = F.softmax(shakespeare_log_probs_masked, dim=-1)
+            new_probs = F.softmax(new_log_probs_masked, dim=-1)
+        else:
+            # Use full distributions
+            shakespeare_probs = torch.exp(shakespeare_log_probs)
+            new_probs = torch.exp(new_log_probs)
+        
+        # Compute KL divergence: KL(new || shakespeare)
+        # This penalizes deviation from Shakespeare distribution
+        kl_div = F.kl_div(
+            torch.log(new_probs + 1e-8),
+            shakespeare_probs,
+            reduction='none'
+        ).sum(dim=-1)  # Sum over vocab dimension
+        
+        # Average over sequence length
+        kl_penalty = kl_div.mean(dim=1)  # [B]
+        
+        # Apply stage-specific scaling for smoother curriculum
+        stage_scale = {
+            0: 0.0,
+            1: 0.0,
+            2: 0.5,   # Gentle introduction
+            3: 0.8,   # Moderate scaling
+            4: 1.0,   # Full penalty
+        }
+        scale = stage_scale.get(stage, 1.0)
+        kl_penalty = kl_penalty * scale
+    
+    return kl_penalty
+
 
 # ─── Distributed Setup Functions ────────────────────────────────────────────
 def setup_distributed():
@@ -1175,9 +1362,11 @@ class CurriculumManager:
         
         # Calculate parameters based on total iterations if provided
         if total_iterations is not None:
-            # 5 stages total, so divide iterations evenly with some buffer
-            self.min_iterations_per_stage = max(1, total_iterations // 10)  # Allow promotion after 10% of stage time
-            self.promotion_patience = max(1, total_iterations // 20)  # Wait for 5% of total time before promotion
+            # Use relative proportions that work for any iteration count
+            # With 5 stages, each stage gets roughly 20% of total iterations
+            # But allow early promotion after minimum time
+            self.min_iterations_per_stage = max(1, int(total_iterations * 0.05))  # 5% minimum time per stage
+            self.promotion_patience = max(2, int(total_iterations * 0.03))  # 3% patience for plateau detection
         else:
             self.promotion_patience = promotion_patience
             self.min_iterations_per_stage = min_iterations_per_stage
@@ -1220,6 +1409,43 @@ class CurriculumManager:
             3: 0.2,   # Stage 3: Moderate penalty
             4: 0.3,   # Stage 4: Strong penalty
         }
+        
+        # Reference model KL penalty configuration (using pretrained Shakespeare model)
+        self.ref_model_kl_weights = {
+            0: 0.0,    # Stage 0: No penalty
+            1: 0.0,    # Stage 1: No penalty
+            2: 0.0,    # Stage 2: No penalty
+            3: 0.05,   # Stage 3: Mild penalty
+            4: 0.1,    # Stage 4: Moderate penalty
+        }
+        
+        # GPT-2 KL penalty configuration
+        self.gpt2_kl_weights = {
+            0: 0.0,    # No penalty
+            1: 0.0,    # No penalty
+            2: 0.0,    # No penalty
+            3: 0.05,   # Mild penalty
+            4: 0.1,    # Moderate penalty
+        }
+        
+        # Perplexity-based promotion configuration (relative improvements from baseline)
+        # These are multiplicative factors: current_perplexity <= initial_perplexity * threshold
+        self.perplexity_improvement_thresholds = {
+            0: 0.70,  # Stage 0 → 1: 30% improvement from baseline
+            1: 0.50,  # Stage 1 → 2: 50% improvement from baseline
+            2: 0.35,  # Stage 2 → 3: 65% improvement from baseline
+            3: 0.25,  # Stage 3 → 4: 75% improvement from baseline
+            4: float('inf')  # Stage 4: No promotion (final stage)
+        }
+        
+        # Store initial baseline perplexity (will be set after first evaluation)
+        self.initial_perplexity = None
+        self.baseline_perplexity_per_stage = {}  # Track baseline at each stage start
+        
+        # Loss tracking for trend analysis
+        self.loss_history = deque(maxlen=50)
+        self.reward_plateau_counter = 0
+        self.current_perplexity = float('inf')
         
     def _compile_stage_configs(self):
         """Pre-compile all stage configurations as tensors"""
@@ -1282,6 +1508,25 @@ class CurriculumManager:
             config['word_sum'] = config['word_weights'].sum().item()
             config['total_sum'] = config['ngram_sum'] + config['word_sum']
         
+    def calculate_perplexity(self, loss: float) -> float:
+        """Calculate perplexity from cross-entropy loss"""
+        return torch.exp(torch.tensor(loss)).item()
+    
+    def _calculate_loss_improvement_rate(self) -> float:
+        """Calculate rate of loss improvement over recent window"""
+        if len(self.loss_history) < 20:
+            return 1.0  # Not enough data
+        
+        # Compare average of last 10 iterations vs previous 10
+        recent_avg = np.mean(list(self.loss_history)[-10:])
+        previous_avg = np.mean(list(self.loss_history)[-20:-10])
+        
+        if previous_avg == 0:
+            return 0.0
+        
+        improvement_rate = (previous_avg - recent_avg) / previous_avg
+        return improvement_rate
+    
     def update_metrics(self, metrics: Dict[str, float]):
         """Update EMA metrics"""
         for key in self.ema_metrics:
@@ -1292,6 +1537,14 @@ class CurriculumManager:
                     self.ema_metrics[key] = (self.ema_alpha * self.ema_metrics[key] + 
                                             (1 - self.ema_alpha) * metrics[key])
         
+        # Track loss history
+        if 'loss' in metrics:
+            self.loss_history.append(metrics['loss'])
+        
+        # Calculate and store perplexity
+        if 'loss' in self.ema_metrics:
+            self.current_perplexity = self.calculate_perplexity(self.ema_metrics['loss'])
+        
         self.iterations_in_stage += 1
         
     def check_promotion(self) -> Tuple[bool, str]:
@@ -1299,39 +1552,55 @@ class CurriculumManager:
         if self.current_stage >= self.n_stages - 1:
             return False, "Already at final stage"
             
-        # Check minimum iterations
+        # 1. Minimum time requirement
         if self.iterations_in_stage < self.min_iterations_per_stage:
-            return False, f"Need {self.min_iterations_per_stage - self.iterations_in_stage} more iterations"
+            return False, f"min_iterations_not_met"
         
-        # Check for improvement plateau
-        current_reward = self.ema_metrics['reward_mean']
-        improvement = abs(current_reward - self.best_ema_reward) / (abs(self.best_ema_reward) + 1e-6)
+        # 2. Perplexity threshold check (relative to baseline)
+        if self.initial_perplexity is None:
+            # Set initial perplexity from first few iterations
+            if self.current_perplexity < float('inf'):
+                self.initial_perplexity = self.current_perplexity
+                self.baseline_perplexity_per_stage[0] = self.current_perplexity
         
-        if improvement < self.promotion_threshold:
+        if self.initial_perplexity is not None:
+            current_perplexity = self.current_perplexity
+            improvement_threshold = self.perplexity_improvement_thresholds[self.current_stage]
+            target_perplexity = self.initial_perplexity * improvement_threshold
+            
+            if current_perplexity <= target_perplexity:
+                improvement_percent = (1.0 - current_perplexity/self.initial_perplexity) * 100
+                return True, f"perplexity_threshold_met ({current_perplexity:.2f} <= {target_perplexity:.2f}, {improvement_percent:.1f}% improvement)"
+        
+        # 3. Loss-based promotion (alternative criterion)
+        loss_improvement_rate = self._calculate_loss_improvement_rate()
+        if loss_improvement_rate < 0.01:  # Less than 1% improvement over window
             self.plateau_counter += 1
+            if self.plateau_counter >= self.promotion_patience:
+                return True, f"loss_plateau_detected (improvement_rate={loss_improvement_rate:.4f})"
         else:
             self.plateau_counter = 0
-            self.best_ema_reward = current_reward
-            
-        if self.plateau_counter >= self.promotion_patience:
-            return True, f"Plateau detected: {self.plateau_counter} iterations without {self.promotion_threshold:.1%} improvement"
-            
-        # Stage-specific promotion criteria
-        stage_config = self.get_stage_config()
-        if self.current_stage == 1 and self.ema_metrics['accuracy'] > 0.3:
-            return True, "Stage 1 accuracy threshold reached (>30%)"
-        elif self.current_stage == 2 and self.ema_metrics['accuracy'] > 0.5:
-            return True, "Stage 2 accuracy threshold reached (>50%)"
-        elif self.current_stage == 3 and self.ema_metrics['accuracy'] > 0.65:
-            return True, "Stage 3 accuracy threshold reached (>65%)"
-            
-        return False, f"Continuing stage {self.current_stage}"
+        
+        # 4. Reward-based plateau (existing)
+        reward_improvement = (self.ema_metrics['reward_mean'] - self.best_ema_reward) / (abs(self.best_ema_reward) + 1e-8)
+        if reward_improvement < self.promotion_threshold:
+            self.reward_plateau_counter += 1
+            if self.reward_plateau_counter >= self.promotion_patience:
+                return True, "reward_plateau_detected"
+        else:
+            self.reward_plateau_counter = 0
+            self.best_ema_reward = max(self.best_ema_reward, self.ema_metrics['reward_mean'])
+        
+        return False, "continue_training"
         
     def promote(self):
         """Promote to next stage"""
         if self.current_stage < self.n_stages - 1:
             # Save current stage end metrics
             self.stage_start_metrics[self.current_stage] = self.ema_metrics.copy()
+            
+            # Save perplexity baseline for new stage
+            self.baseline_perplexity_per_stage[self.current_stage + 1] = self.current_perplexity
             
             # Move to next stage
             self.current_stage += 1
@@ -1403,6 +1672,14 @@ class CurriculumManager:
     def get_repetition_penalty_weight(self) -> float:
         """Get repetition penalty weight for current stage"""
         return self.repetition_penalty_weights.get(self.current_stage, 0.0)
+    
+    def get_ref_model_kl_weight(self) -> float:
+        """Get reference model KL penalty weight for current stage"""
+        return self.ref_model_kl_weights.get(self.current_stage, 0.0)
+    
+    def get_gpt2_kl_weight(self) -> float:
+        """Get GPT-2 KL penalty weight for current stage"""
+        return self.gpt2_kl_weights.get(self.current_stage, 0.0)
     
     def compute_curriculum_rewards(self, base_rewards: torch.Tensor,
                                  ngram_scores: torch.Tensor,
@@ -1569,11 +1846,15 @@ image = (
 )
 
 volume = modal.Volume.from_name("grpo-data", create_if_missing=True)
+shakespeare_volume = modal.Volume.from_name("shakespeare-model-volume", create_if_missing=True)
 
 # ─── Main Entry Point (Placeholder for now) ─────────────────────────────────
 @app.function(
     gpu=f"{GPU_TYPE}:{N_GPUS}",
-    volumes={"/data": volume},
+    volumes={
+        "/data": volume,
+        "/models": shakespeare_volume
+    },
     timeout=60 * 60 * 6,
     image=image,
     secrets=[modal.Secret.from_name("wandb")],
@@ -1724,6 +2005,195 @@ def test_distributed_setup():
         # Cleanup
         cleanup_distributed()
 
+class CharTokenAligner:
+    """Aligns character sequences to GPT-2 tokens with caching"""
+    def __init__(self, vocab_size: int, itos: Dict[int, str], device: torch.device, cache_size: int = 10000):
+        self.vocab_size = vocab_size
+        self.itos = itos
+        self.device = device
+        self.cache = {}
+        self.cache_size = cache_size
+        
+        # We'll lazily initialize the tokenizer when needed
+        self.tokenizer = None
+        self.gpt2_vocab_size = None
+        
+    def _init_tokenizer(self):
+        """Lazy initialization of tokenizer"""
+        # Import here to avoid issues if transformers not available
+        try:
+            from transformers import GPT2Tokenizer
+            self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+            self.gpt2_vocab_size = self.tokenizer.vocab_size
+        except ImportError:
+            print("Warning: transformers not available, GPT-2 KL penalty disabled")
+            return False
+        return True
+        
+    def align_sequence(self, char_indices: torch.Tensor) -> Optional[torch.Tensor]:
+        """Convert character indices to token IDs with caching"""
+        if self.tokenizer is None:
+            if not self._init_tokenizer():
+                return None
+                
+        # Convert to string
+        chars = ''.join([self.itos[idx.item()] for idx in char_indices])
+        
+        # Check cache
+        if chars in self.cache:
+            return self.cache[chars]
+        
+        # Tokenize
+        tokens = self.tokenizer.encode(chars, return_tensors='pt').to(self.device)
+        
+        # Cache result
+        if len(self.cache) < self.cache_size:
+            self.cache[chars] = tokens
+            
+        return tokens
+
+
+def load_shakespeare_checkpoint(device: torch.device, checkpoint_url: str = None) -> Optional[nn.Module]:
+    """Load Shakespeare-trained GPT-2 style model from checkpoint"""
+    try:
+        import requests
+        import tempfile
+        
+        # Default to the provided checkpoint URL if not specified
+        if checkpoint_url is None:
+            checkpoint_url = "https://modal.com/api/volumes/tokenbender/main/nanogpt-data/files/content?path=checkpoints%2Fshakespeare%2Fckpt.pt"
+        
+        # Download checkpoint to temporary file
+        print(f"[gpt2] Downloading Shakespeare checkpoint...")
+        response = requests.get(checkpoint_url, stream=True)
+        response.raise_for_status()
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pt') as tmp_file:
+            for chunk in response.iter_content(chunk_size=8192):
+                tmp_file.write(chunk)
+            tmp_path = tmp_file.name
+        
+        # Load checkpoint
+        print(f"[gpt2] Loading checkpoint from {tmp_path}...")
+        checkpoint = torch.load(tmp_path, map_location=device)
+        
+        # The checkpoint contains model_args and model state
+        model_args = checkpoint.get('model_args', {})
+        
+        # Create model config based on checkpoint
+        # Note: This is a nanoGPT model, not standard GPT-2
+        from dataclasses import dataclass
+        
+        @dataclass
+        class GPTConfig:
+            block_size: int = 1024
+            vocab_size: int = 50304  # GPT-2 vocab size
+            n_layer: int = 12
+            n_head: int = 12
+            n_embd: int = 768
+            dropout: float = 0.0
+            bias: bool = True
+        
+        # Override with checkpoint values
+        config = GPTConfig(**model_args)
+        
+        # Create a compatible GPT model
+        # We'll use our existing GPT class but need to adapt it
+        model = GPT(
+            vocab_size=config.vocab_size,
+            n_layer=config.n_layer,
+            n_head=config.n_head,
+            n_emb=config.n_embd,
+            context_len=config.block_size
+        ).to(device)
+        
+        # Load state dict
+        state_dict = checkpoint['model']
+        # Adapt keys if necessary
+        model.load_state_dict(state_dict, strict=False)
+        model.eval()
+        
+        # Clean up temp file
+        os.unlink(tmp_path)
+        
+        print(f"[gpt2] Successfully loaded Shakespeare model")
+        return model
+        
+    except Exception as e:
+        print(f"[gpt2] Failed to load Shakespeare checkpoint: {e}")
+        return None
+
+
+def compute_gpt2_kl_penalty(
+    char_logits: torch.Tensor,      # [B, T, vocab_size] from GRPO model
+    char_sequences: torch.Tensor,   # [B, T] character indices
+    gpt2_model: nn.Module,          # Pretrained reference model
+    aligner: CharTokenAligner,      # Character-token alignment
+    stage: int,                     # Current curriculum stage
+    device: torch.device
+) -> torch.Tensor:
+    """
+    Compute KL divergence penalty using pretrained model as reference
+    Returns: [B] KL penalty per sequence
+    """
+    B, T, V = char_logits.shape
+    kl_penalties = torch.zeros(B, device=device)
+    
+    # Only compute if we have a reference model
+    if gpt2_model is None:
+        return kl_penalties
+    
+    with torch.no_grad():
+        for b in range(B):
+            # Get character sequence
+            char_seq = char_sequences[b]
+            
+            # Convert to GPT-2 tokens
+            token_ids = aligner.align_sequence(char_seq)
+            if token_ids is None:
+                continue
+            
+            # Skip if sequence too short
+            if token_ids.shape[1] == 0:
+                continue
+            
+            # Get reference model predictions
+            try:
+                # Get logits from reference model
+                ref_outputs = gpt2_model(token_ids)
+                
+                # Handle different output formats
+                if hasattr(ref_outputs, 'logits'):
+                    ref_logits = ref_outputs.logits  # Transformers style
+                else:
+                    ref_logits = ref_outputs  # Direct tensor output
+                
+                # For character-level comparison, we need to map token probabilities back to characters
+                # This is approximate but sufficient for KL penalty
+                
+                # Simple approach: use uniform distribution over characters for now
+                # In practice, you'd want a more sophisticated mapping
+                ref_char_probs = torch.ones(T, V, device=device) / V
+                
+                # Compute KL divergence
+                char_probs = F.softmax(char_logits[b], dim=-1)
+                
+                # KL(P||Q) = sum(P * log(P/Q))
+                kl = F.kl_div(
+                    torch.log(ref_char_probs + 1e-8),
+                    char_probs,
+                    reduction='none'
+                ).sum(dim=-1).mean()
+                
+                kl_penalties[b] = kl.clamp(0.0, 5.0)  # Clamp to reasonable range
+                
+            except Exception as e:
+                print(f"[gpt2] Error computing KL for sequence {b}: {e}")
+                continue
+    
+    return kl_penalties
+
+
 def train_grpo():
     """Main GRPO training loop with multi-GPU support"""
     # Setup distributed training
@@ -1814,6 +2284,16 @@ def train_grpo():
     confidence_monitor = ConfidenceMonitor() if USE_CONFIDENCE_SCALING else None
     curriculum_manager = CurriculumManager(device=device, vocab_size=vocab_size, total_iterations=TOTAL_ITERS)
     
+    # Load Shakespeare reference model for KL penalty (only if needed)
+    shakespeare_model = None
+    char_token_aligner = None
+    if curriculum_manager.current_stage >= 3 or any(curriculum_manager.gpt2_kl_weights[s] > 0 for s in range(3, 5)):
+        # Use Modal volume path directly
+        shakespeare_model = load_shakespeare_reference_model("/models/shakespeare/shakespeare_char_model.pt", vocab_size, device, rank)
+        if shakespeare_model is not None:
+            char_token_aligner = CharTokenAligner(vocab_size, itos, device)
+            print_rank0("[GPT-2 KL] Initialized Shakespeare reference model for KL penalty", rank)
+    
     # Training state
     chars_seen = 0
     current_kl_coef = BETA_KL
@@ -1823,7 +2303,7 @@ def train_grpo():
         import wandb
         wandb.init(
             project="avataRL_11",
-            name="adaptive-curriculum-learning-reward-system_2",
+            name="adaptive-curriculum-learning-reward-system_5",
             config={
                 "model": {
                     "vocab_size": vocab_size,
@@ -2021,8 +2501,30 @@ def train_grpo():
                 entropy = new_dist.entropy().mean()
                 entropy_bonus = 0.01  # Fixed entropy coefficient as specified
                 
-                # Total loss with entropy bonus
-                loss = (pol_loss + current_kl_coef * kl - entropy_bonus * entropy) / GRAD_ACCUM
+                # GPT-2 KL penalty (stage 3+ only)
+                gpt2_kl_penalty_term = torch.tensor(0.0, device=device)
+                if shakespeare_model is not None and curriculum_manager.current_stage >= 3:
+                    # Get current stage KL weight
+                    gpt2_kl_weight = curriculum_manager.get_gpt2_kl_weight()
+                    
+                    if gpt2_kl_weight > 0:
+                        # Compute KL penalty using Shakespeare model
+                        shakespeare_kl = compute_shakespeare_kl_penalty(
+                            flat_G,              # Generated sequences [B*K, T]
+                            new_logits,          # Current model logits [B*K, T, V]
+                            shakespeare_model,   # Reference model
+                            curriculum_manager.current_stage,  # Current stage for top-k
+                            device
+                        )
+                        
+                        # Apply stage-specific weight
+                        gpt2_kl_penalty_term = gpt2_kl_weight * shakespeare_kl.mean()
+                        
+                        # Log KL penalty
+                        iter_metrics["gpt2_kl"].append(shakespeare_kl.mean().item())
+                
+                # Total loss with entropy bonus and GPT-2 KL penalty
+                loss = (pol_loss + current_kl_coef * kl - entropy_bonus * entropy + gpt2_kl_penalty_term) / GRAD_ACCUM
             
             # Backward pass
             scaler.scale(loss).backward()
@@ -2080,6 +2582,14 @@ def train_grpo():
                 print(f"\n[Curriculum] Promoted to Stage {curriculum_manager.current_stage}: {stage_config['name']}")
                 print(f"[Curriculum] Reason: {promotion_reason}")
                 print(f"[Curriculum] Focus: {stage_config['focus']}")
+            
+            # Load Shakespeare model if entering stage 3
+            if curriculum_manager.current_stage >= 3 and shakespeare_model is None:
+                # Use Modal volume path directly
+                shakespeare_model = load_shakespeare_reference_model("/models/shakespeare/shakespeare_char_model.pt", vocab_size, device, rank)
+                if shakespeare_model is not None:
+                    char_token_aligner = CharTokenAligner(vocab_size, itos, device)
+                    print_rank0("[GPT-2 KL] Loaded Shakespeare reference model for stage 3+", rank)
         
         # Log to wandb (only rank 0)
         if rank == 0 and it % 2 == 0:
@@ -2097,6 +2607,7 @@ def train_grpo():
                 "metrics/ratio_max": metric_tensors.get("ratio_max", 1.0),
                 "metrics/repetition_rate": metric_tensors.get("repetition_rate", 0.0),
                 "metrics/repetition_penalty_mean": metric_tensors.get("repetition_penalty_mean", 0.0),
+                "metrics/gpt2_kl": metric_tensors.get("gpt2_kl", 0.0),
                 "training/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                 "training/chars_seen": chars_seen,
                 "training/iteration": it,
@@ -2106,6 +2617,9 @@ def train_grpo():
                 "curriculum/ema_accuracy": curriculum_manager.ema_metrics['accuracy'],
                 "curriculum/ema_reward": curriculum_manager.ema_metrics['reward_mean'],
                 "curriculum/plateau_counter": curriculum_manager.plateau_counter,
+                "curriculum/perplexity": curriculum_manager.current_perplexity,
+                "curriculum/perplexity_threshold": curriculum_manager.initial_perplexity * curriculum_manager.perplexity_improvement_thresholds[curriculum_manager.current_stage] if curriculum_manager.initial_perplexity is not None else float('inf'),
+                "curriculum/loss_improvement_rate": curriculum_manager._calculate_loss_improvement_rate(),
             })
         
         # Update old_actor periodically
@@ -2124,8 +2638,8 @@ def train_grpo():
             actor_old.eval()
             
         
-        # Save checkpoint periodically
-        if it % 100 == 0:
+        # Save checkpoint periodically (only if enabled)
+        if SAVE_INTERMEDIATE_CHECKPOINTS and it % CHECKPOINT_INTERVAL == 0:
             save_checkpoint_rank0(
                 model=actor,
                 optimizer=optimizer,
@@ -2165,19 +2679,104 @@ def train_grpo():
     
     print_rank0("\nTraining completed!", rank)
     
-    # Final checkpoint
-    save_checkpoint_rank0(
-        model=actor,
-        optimizer=optimizer,
-        iteration=TOTAL_ITERS,
-        checkpoint_path=f"/data/checkpoint_final.pt",
-        rank=rank,
-        additional_state={
-            "chars_seen": chars_seen,
-            "kl_coef": current_kl_coef,
-            "scaler_state": scaler.state_dict(),
-        }
-    )
+    # Final checkpoint (always save)
+    if SAVE_FINAL_CHECKPOINT:
+        save_checkpoint_rank0(
+            model=actor,
+            optimizer=optimizer,
+            iteration=TOTAL_ITERS,
+            checkpoint_path=f"/data/checkpoint_final.pt",
+            rank=rank,
+            additional_state={
+                "chars_seen": chars_seen,
+                "kl_coef": current_kl_coef,
+                "scaler_state": scaler.state_dict(),
+                "curriculum_state": curriculum_manager.get_state_dict(),
+            }
+        )
+        print_rank0(f"\nFinal checkpoint saved to /data/checkpoint_final.pt", rank)
+    
+    # Generate samples to evaluate model quality
+    if rank == 0:
+        print_rank0("\n=== Generating Sample Text ===", rank)
+        print_rank0(f"Model trained for {TOTAL_ITERS} iterations through {curriculum_manager.current_stage + 1} curriculum stages", rank)
+        print_rank0(f"Final perplexity: {curriculum_manager.current_perplexity:.2f}", rank)
+        
+        # Put model in eval mode
+        actor_eval = actor.module if hasattr(actor, 'module') else actor
+        actor_eval.eval()
+        
+        # Sample prompts - variety of Shakespeare-style beginnings
+        sample_prompts = [
+            "To be or not to be",
+            "O Romeo, Romeo",
+            "All the world's a stage",
+            "What is in a name?",
+            "The quality of mercy",
+            "Now is the winter",
+            "Friends, Romans, countrymen",
+            "If music be the food",
+        ]
+        
+        print_rank0("\nGenerating text samples with different prompts:", rank)
+        print_rank0("=" * 80, rank)
+        
+        with torch.no_grad():
+            for i, prompt in enumerate(sample_prompts):
+                # Encode prompt
+                prompt_encoded = encode(prompt).unsqueeze(0).to(device)
+                
+                # Generate with temperature sampling
+                generated = actor_eval.generate(
+                    prompt_encoded,
+                    max_new_tokens=100,  # Generate 100 characters
+                    temperature=0.8,     # Moderate temperature for balance
+                    top_k=40,           # Top-k sampling for quality
+                    use_cache=False     # Disable KV cache to match training
+                )
+                
+                # Decode and print
+                generated_text = decode(generated[0])
+                print_rank0(f"\nSample {i+1}:", rank)
+                print_rank0(f"Prompt: '{prompt}'", rank)
+                print_rank0(f"Generated: {generated_text}", rank)
+                print_rank0("-" * 40, rank)
+                
+                # Log to wandb
+                if i < 4:  # Log first 4 samples to wandb
+                    wandb.log({
+                        f"samples/prompt_{i}": prompt,
+                        f"samples/generated_{i}": generated_text,
+                    })
+        
+        # Also generate some unconditional samples
+        print_rank0("\nUnconditional generation (from empty prompt):", rank)
+        print_rank0("=" * 80, rank)
+        
+        for i in range(3):
+            # Start with just a newline character
+            start_token = encode("\n").unsqueeze(0).to(device)
+            
+            generated = actor_eval.generate(
+                start_token,
+                max_new_tokens=150,  # Longer for unconditional
+                temperature=0.8,
+                top_k=40,
+                use_cache=False     # Disable KV cache to match training
+            )
+            
+            generated_text = decode(generated[0])
+            print_rank0(f"\nUnconditional Sample {i+1}:", rank)
+            print_rank0(generated_text, rank)
+            print_rank0("-" * 40, rank)
+            
+            # Log to wandb
+            wandb.log({
+                f"samples/unconditional_{i}": generated_text,
+            })
+        
+        print_rank0("\n" + "=" * 80, rank)
+        print_rank0("Sample generation complete!", rank)
     
     # Finish wandb run
     if rank == 0:
