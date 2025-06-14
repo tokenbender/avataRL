@@ -1,4 +1,4 @@
-continuing from where the thinking.md file left off, focusing on implementing the outlined strategy steps.
+continuing from where the thinking.md[https://github.com/tokenbender/avataRL/blob/main/THINKING.md] file left off, focusing on implementing the outlined strategy steps.
 
 the idea is that rl typically elicits latent abilities that the weights has from the training data (pretrain/midtrain).
 
