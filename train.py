@@ -23,7 +23,7 @@ GRAD_ACCUM = BATCH // (MICRO_BATCH * N_GPUS)
 EPOCHS = 0.4
 DATASET_SIZE = 1_115_394
 ITERS_PER_EPOCH = DATASET_SIZE // BATCH
-TOTAL_ITERS = ITERS_PER_EPOCH * EPOCHS
+TOTAL_ITERS = int(ITERS_PER_EPOCH * EPOCHS)
 LR = 3e-3
 BETA_KL = 0.1
 KL_WARM = int(DATASET_SIZE * 0.8)
@@ -443,7 +443,7 @@ def load_shakespeare_reference_model(checkpoint_path: str, vocab_size: int, devi
                         break
                 if not found:
                     raise FileNotFoundError(f"Shakespeare checkpoint not found at {checkpoint_path} or alternative paths")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
         if 'model_args' in checkpoint:
             model_args = checkpoint['model_args']
             n_layer = model_args.get('n_layer', 6)
@@ -1326,7 +1326,7 @@ def load_checkpoint_all_ranks(
 ) -> Dict:
     """Load checkpoint on all ranks with proper synchronization"""
     if rank == 0:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     else:
         checkpoint = None
     checkpoint_exists = torch.tensor([1 if checkpoint is not None else 0], device=device)
@@ -1335,7 +1335,7 @@ def load_checkpoint_all_ranks(
     if checkpoint_exists.item() == 0:
         return {}
     if rank != 0:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     if hasattr(model, "module"):
         model.module.load_state_dict(checkpoint["model_state_dict"])
     else:
@@ -1501,7 +1501,7 @@ def load_shakespeare_checkpoint(device: torch.device, checkpoint_url: str = None
                 tmp_file.write(chunk)
             tmp_path = tmp_file.name
         print(f"[gpt2] Loading checkpoint from {tmp_path}...")
-        checkpoint = torch.load(tmp_path, map_location=device)
+        checkpoint = torch.load(tmp_path, map_location=device, weights_only=True)
         model_args = checkpoint.get('model_args', {})
         from dataclasses import dataclass
         @dataclass
