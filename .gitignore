@@ -168,6 +168,7 @@ claude-workspace/
 *.claude-backup
 *.claude-tmp
 CLAUDE.md
+AGENT.md
 TODO.md
 BRAINSTORM.md
 brainstorm/
