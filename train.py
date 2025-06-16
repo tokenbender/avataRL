@@ -14,13 +14,13 @@ from functools import partial
 from collections import deque
 N_GPUS = 8
 GPU_TYPE = "H100"
-app = modal.App("adaptive-curriculum-learning-reward-system_9")
+app = modal.App("avataRL_full_logging")
 CONTEXT_LEN = 32
 HORIZON = 8
 BATCH = 16384
 MICRO_BATCH = 256
 GRAD_ACCUM = BATCH // (MICRO_BATCH * N_GPUS)
-EPOCHS = 0.4
+EPOCHS = 1.0
 DATASET_SIZE = 1_115_394
 ITERS_PER_EPOCH = DATASET_SIZE // BATCH
 TOTAL_ITERS = int(ITERS_PER_EPOCH * EPOCHS)
@@ -843,10 +843,15 @@ def compute_rewards_multi_char(gen: torch.Tensor, ref: torch.Tensor, ref_logits:
     """
     exact_match = (gen == ref).float()
     with torch.no_grad():
-        ref_probs = F.softmax(ref_logits, dim=-1)
         B, T = gen.shape
-        gen_probs = ref_probs.gather(2, gen.unsqueeze(-1)).squeeze(-1)
-        partial_reward = gen_probs
+        if ref_logits is not None:
+            ref_probs = F.softmax(ref_logits, dim=-1)
+            gen_probs = ref_probs.gather(2, gen.unsqueeze(-1)).squeeze(-1)
+            partial_reward = gen_probs
+        else:
+            # No partial rewards without reference model
+            partial_reward = torch.zeros_like(exact_match)
+            gen_probs = torch.zeros_like(exact_match)  # Placeholder for metrics
     base_reward = exact_match + partial_reward
     repetition_penalties = torch.zeros(B, device=gen.device)
     if curriculum_manager is not None and curriculum_manager.current_stage >= 2:
@@ -1028,9 +1033,9 @@ class CurriculumManager:
             4: 0.1,    
         }
         self.gpt2_kl_weights = {
-            0: 0.0,    
-            1: 0.0,    
-            2: 0.0,    
+            0: 0.05,    
+            1: 0.05,    
+            2: 0.05,    
             3: 0.05,   
             4: 0.1,    
         }
@@ -1105,8 +1110,17 @@ class CurriculumManager:
             config['word_sum'] = config['word_weights'].sum().item()
             config['total_sum'] = config['ngram_sum'] + config['word_sum']
     def calculate_perplexity(self, loss: float) -> float:
-        """Calculate perplexity from cross-entropy loss"""
-        return torch.exp(torch.tensor(loss)).item()
+        """Calculate perplexity from cross-entropy loss
+        
+        Args:
+            loss: Cross-entropy loss (negative log likelihood)
+        
+        Returns:
+            Perplexity value (exp(loss))
+        """
+        # Cap loss to prevent overflow
+        capped_loss = min(loss, 20.0)
+        return torch.exp(torch.tensor(capped_loss)).item()
     def _calculate_loss_improvement_rate(self) -> float:
         """Calculate rate of loss improvement over recent window"""
         if len(self.loss_history) < 20:
@@ -1128,7 +1142,10 @@ class CurriculumManager:
                                             (1 - self.ema_alpha) * metrics[key])
         if 'loss' in metrics:
             self.loss_history.append(metrics['loss'])
-        if 'loss' in self.ema_metrics:
+        if 'cross_entropy' in self.ema_metrics:
+            self.current_perplexity = self.calculate_perplexity(self.ema_metrics['cross_entropy'])
+        elif 'loss' in self.ema_metrics:
+            # Fallback to loss if cross_entropy not available (shouldn't happen)
             self.current_perplexity = self.calculate_perplexity(self.ema_metrics['loss'])
         self.iterations_in_stage += 1
     def check_promotion(self) -> Tuple[bool, str]:
@@ -1358,7 +1375,7 @@ shakespeare_volume = modal.Volume.from_name("nanogpt-data", create_if_missing=Fa
     },
     timeout=60 * 60 * 6,
     image=image,
-    secrets=[modal.Secret.from_name("wandb")],
+    secrets=[modal.Secret.from_name("wandb-secret")],
 )
 def train_distributed():
     """Launch distributed training with torchrun - following modal_nanogpt_simple.py pattern"""
@@ -1368,9 +1385,13 @@ def train_distributed():
     script_content = Path(__file__).read_text()
     temp_script = "/tmp/train_multi_gpu.py"
     Path(temp_script).write_text(script_content)
-    subprocess.run([
+    # Stream output in real-time instead of capturing
+    result = subprocess.run([
         "torchrun", f"--nproc-per-node={N_GPUS}", temp_script
-    ], check=True)
+    ])
+    
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, result.args)
     return "Distributed training test completed successfully!"
 def test_distributed_setup():
     """Test function to verify distributed setup works"""
@@ -1432,19 +1453,22 @@ def test_distributed_setup():
                 else:
                     output = model(dummy_input)
             print(f"Model output shape: {output.shape} (expected: {(batch_size, seq_len, vocab_size)})")
-            ref_model = OnTheFlyNGramRef(text, stoi, vocab_size).to(device)
-            ref_output = ref_model(dummy_input)
-            print(f"Reference model output shape: {ref_output.shape}")
+            # Bigram reference model disabled - using only Shakespeare model KL
+            # ref_model = OnTheFlyNGramRef(text, stoi, vocab_size).to(device)
+            # ref_output = ref_model(dummy_input)
+            # print(f"Reference model output shape: {ref_output.shape}")
             attn_module = model.layers[0].attn
             print(f"Flash Attention enabled: {attn_module.use_flash_attn}")
             print("\n=== Testing GRPO Components ===")
             all_chars, log_probs = generate_exhaustive_single_char(model, ctx, vocab_size)
             print(f"Exhaustive generation: all_chars shape {all_chars.shape}, log_probs shape {log_probs.shape}")
             ref_char = tgt[:, 0]  
-            rewards = compute_exhaustive_rewards(
-                all_chars, ref_char, ref_model, ctx, vocab_size,
-                model_log_probs=log_probs
-            )
+            # Skipping exhaustive rewards test - ref_model disabled
+            # rewards = compute_exhaustive_rewards(
+            #     all_chars, ref_char, ref_model, ctx, vocab_size,
+            #     model_log_probs=log_probs
+            # )
+            rewards = torch.zeros(all_chars.shape[0], all_chars.shape[1], device=device)
             print(f"Rewards shape: {rewards.shape}, mean: {rewards.mean():.3f}, std: {rewards.std():.3f}")
         print_rank0("\nAll tests complete!", rank)
     except Exception as e:
@@ -1587,7 +1611,9 @@ def train_grpo():
     print_rank0(f"Total batch size: {BATCH} samples", rank)
     print_rank0(f"Effective batch per GPU: {MICRO_BATCH * GRAD_ACCUM} samples", rank)
     character_analyzer = CharacterDifficultyAnalyzer(text, stoi, vocab_size, device)
-    ref_model = OnTheFlyNGramRef(text, stoi, vocab_size).to(device).eval()
+    # Bigram reference model disabled - using only Shakespeare model KL
+    # ref_model = OnTheFlyNGramRef(text, stoi, vocab_size).to(device).eval()
+    ref_model = None  # Placeholder to avoid errors
     if world_size > 1 and dist.is_initialized():
         dist.barrier(device_ids=[device.index] if device.type == 'cuda' else None)
     torch.manual_seed(42)  
@@ -1628,7 +1654,9 @@ def train_grpo():
         world_size=world_size,
         device=device
     )
-    kl_controller = AdaptiveKLController(target_kl=0.02)
+    # KL controller disabled - using only Shakespeare model KL
+    # kl_controller = AdaptiveKLController(target_kl=0.02)
+    kl_controller = None
     confidence_monitor = ConfidenceMonitor() if USE_CONFIDENCE_SCALING else None
     curriculum_manager = CurriculumManager(device=device, vocab_size=vocab_size, total_iterations=TOTAL_ITERS)
     shakespeare_model = None
@@ -1639,12 +1667,13 @@ def train_grpo():
             char_token_aligner = CharTokenAligner(vocab_size, itos, device)
             print_rank0("[GPT-2 KL] Initialized Shakespeare reference model for KL penalty", rank)
     chars_seen = 0
-    current_kl_coef = BETA_KL
+    # current_kl_coef = BETA_KL  # Disabled - using only Shakespeare model KL
+    current_kl_coef = 0.0
     if rank == 0:
         import wandb
         wandb.init(
             project="avataRL_11",
-            name="adaptive-curriculum-learning-reward-system_9",
+            name="issue17_1",
             config={
                 "model": {
                     "vocab_size": vocab_size,
@@ -1705,25 +1734,31 @@ def train_grpo():
                     model_pred = model_logits.argmax(dim=-1)
                     model_accuracy = (model_pred == ref_tok[:, 0]).float().mean().item()
                     iter_metrics["accuracy"].append(model_accuracy)
-                    ref_full = torch.cat([ctx, ref_tok], dim=1)
-                    _, components = ref_model(ref_full[:, -HORIZON-1:], return_components=True)
-                    bigram_logits = components['bigram'][:, -1, :]
-                    bigram_pred = bigram_logits.argmax(dim=-1)
-                    bigram_correct = (bigram_pred == ref_tok[:, 0]).float().mean().item()
-                    iter_metrics["bigram_accuracy"].append(bigram_correct)
+                    # Bigram accuracy calculation disabled - using only Shakespeare model KL
+                    # ref_full = torch.cat([ctx, ref_tok], dim=1)
+                    # _, components = ref_model(ref_full[:, -HORIZON-1:], return_components=True)
+                    # bigram_logits = components['bigram'][:, -1, :]
+                    # bigram_pred = bigram_logits.argmax(dim=-1)
+                    # bigram_correct = (bigram_pred == ref_tok[:, 0]).float().mean().item()
+                    # iter_metrics["bigram_accuracy"].append(bigram_correct)
+                    iter_metrics["bigram_accuracy"].append(0.0)  # Placeholder for metrics
                 B = ctx.shape[0]  
                 R = torch.zeros_like(G, dtype=torch.float32)
                 for k in range(K_SAMPLES):
                     gen = G[:, k, :]
-                    with torch.no_grad():
-                        full_seq = torch.cat([ctx, gen], dim=1)
-                        ref_logits = ref_model(full_seq[:, -HORIZON-1:])[:, -HORIZON:]
+                    # Bigram reference model disabled
+                    # with torch.no_grad():
+                    #     full_seq = torch.cat([ctx, gen], dim=1)
+                    #     ref_logits = ref_model(full_seq[:, -HORIZON-1:])[:, -HORIZON:]
+                    ref_logits = None  # Will be handled in compute_rewards_multi_char
                     if micro_step == 0 and k == 0:
-                        with torch.no_grad():
-                            ref_full = torch.cat([ctx, ref_tok], dim=1)
-                            _, components = ref_model(ref_full[:, -HORIZON-1:], return_components=True)
-                            bigram_acc = (components['bigram'][:, -1, :].argmax(dim=-1) == ref_tok[:, 0]).float().mean()
-                            ngram_scores = torch.stack([bigram_acc, torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)]).unsqueeze(0).expand(B, -1)
+                        # Bigram reference model disabled
+                        # with torch.no_grad():
+                        #     ref_full = torch.cat([ctx, ref_tok], dim=1)
+                        #     _, components = ref_model(ref_full[:, -HORIZON-1:], return_components=True)
+                        #     bigram_acc = (components['bigram'][:, -1, :].argmax(dim=-1) == ref_tok[:, 0]).float().mean()
+                        #     ngram_scores = torch.stack([bigram_acc, torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)]).unsqueeze(0).expand(B, -1)
+                        ngram_scores = torch.zeros(B, 3, device=device)  # Placeholder
                     reward, metrics = compute_rewards_multi_char(gen, ref_tok, ref_logits,
                                                                 curriculum_manager, ctx, ngram_scores)
                     R[:, k, :] = reward
@@ -1755,19 +1790,21 @@ def train_grpo():
                 pol_loss1 = -flat_adv.squeeze(-1) * ratio
                 pol_loss2 = -flat_adv.squeeze(-1) * clipped_ratio
                 pol_loss = torch.max(pol_loss1, pol_loss2).mean()
-                ref_logits = ref_model(full_seq[:, -HORIZON-1:])[:, -HORIZON:]
-                true_probs = torch.zeros_like(new_logits)
-                true_probs.scatter_(2, flat_G.unsqueeze(-1), 1.0)
-                new_probs = F.softmax(new_logits, dim=-1)
-                true_char_probs = new_probs.gather(2, flat_G.unsqueeze(-1)).squeeze(-1)
-                kl_divergence = -torch.log(true_char_probs + 1e-8).mean()
-                kl = torch.clamp(kl_divergence, max=5.0)
-                if kl_controller and micro_step == 0:
-                    current_kl_coef = kl_controller.update(kl.item(), current_kl_coef)
+                # Bigram reference model KL penalty disabled - using only Shakespeare model KL
+                # ref_logits = ref_model(full_seq[:, -HORIZON-1:])[:, -HORIZON:]
+                # true_probs = torch.zeros_like(new_logits)
+                # true_probs.scatter_(2, flat_G.unsqueeze(-1), 1.0)
+                # new_probs = F.softmax(new_logits, dim=-1)
+                # true_char_probs = new_probs.gather(2, flat_G.unsqueeze(-1)).squeeze(-1)
+                # kl_divergence = -torch.log(true_char_probs + 1e-8).mean()
+                # kl = torch.clamp(kl_divergence, max=5.0)
+                # if kl_controller and micro_step == 0:
+                #     current_kl_coef = kl_controller.update(kl.item(), current_kl_coef)
+                kl = torch.tensor(0.0, device=device)  # Placeholder for metrics
                 entropy = new_dist.entropy().mean()
                 entropy_bonus = 0.01  
                 gpt2_kl_penalty_term = torch.tensor(0.0, device=device)
-                if shakespeare_model is not None and curriculum_manager.current_stage >= 3:
+                if shakespeare_model is not None:
                     gpt2_kl_weight = curriculum_manager.get_gpt2_kl_weight()
                     if gpt2_kl_weight > 0:
                         shakespeare_kl = compute_shakespeare_kl_penalty(
@@ -1779,7 +1816,13 @@ def train_grpo():
                         )
                         gpt2_kl_penalty_term = gpt2_kl_weight * shakespeare_kl.mean()
                         iter_metrics["gpt2_kl"].append(shakespeare_kl.mean().item())
-                loss = (pol_loss + current_kl_coef * kl - entropy_bonus * entropy + gpt2_kl_penalty_term) / GRAD_ACCUM
+                loss = (pol_loss - entropy_bonus * entropy + gpt2_kl_penalty_term) / GRAD_ACCUM
+            
+            # Calculate cross-entropy loss for perplexity (not used for training)
+            with torch.no_grad():
+                ce_loss = F.cross_entropy(new_logits.reshape(-1, vocab_size), flat_G.reshape(-1))
+                iter_metrics["cross_entropy"].append(ce_loss.item())
+            
             scaler.scale(loss).backward()
             total_loss += loss.item()
             iter_metrics["pol_loss"].append(pol_loss.item())
@@ -1809,7 +1852,8 @@ def train_grpo():
             'accuracy': metric_tensors.get('accuracy', 0.0),
             'reward_mean': metric_tensors.get('reward_mean', 0.0),
             'kl_divergence': metric_tensors.get('kl', 0.0),
-            'loss': total_loss * GRAD_ACCUM
+            'loss': total_loss * GRAD_ACCUM,
+            'cross_entropy': metric_tensors.get('cross_entropy', 0.0)
         }
         curriculum_manager.update_metrics(curriculum_metrics)
         should_promote, promotion_reason = curriculum_manager.check_promotion()
@@ -1854,9 +1898,13 @@ def train_grpo():
                 "curriculum/perplexity_threshold": curriculum_manager.initial_perplexity * curriculum_manager.perplexity_improvement_thresholds[curriculum_manager.current_stage] if curriculum_manager.initial_perplexity is not None else float('inf'),
                 "curriculum/loss_improvement_rate": curriculum_manager._calculate_loss_improvement_rate(),
             })
+        # Log every iteration for better visibility
+        if rank == 0:
+            print(f"Iter {it}: loss={total_loss*GRAD_ACCUM:.4f}, acc={metric_tensors.get('accuracy', 0):.3f}, "
+                  f"kl={metric_tensors.get('kl', 0):.4f}, gpt2_kl={metric_tensors.get('gpt2_kl', 0):.4f}, "
+                  f"stage={curriculum_manager.current_stage}, chars={chars_seen:,}", flush=True)
+        
         if it % 5 == 0:
-            if rank == 0:
-                print(f"Iter {it}: loss={total_loss*GRAD_ACCUM:.4f}, acc={metric_tensors.get('accuracy', 0):.3f}, kl={metric_tensors.get('kl', 0):.4f}")
             actor_state = actor.module.state_dict() if hasattr(actor, 'module') else actor.state_dict()
             actor_old.load_state_dict(actor_state)
             if world_size > 1:
