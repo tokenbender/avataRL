@@ -14,13 +14,13 @@ from functools import partial
 from collections import deque
 N_GPUS = 8
 GPU_TYPE = "H100"
-app = modal.App("avataRL_full_logging")
+app = modal.App("perplexity_fix_2")
 CONTEXT_LEN = 32
 HORIZON = 8
 BATCH = 16384
 MICRO_BATCH = 256
 GRAD_ACCUM = BATCH // (MICRO_BATCH * N_GPUS)
-EPOCHS = 1.0
+EPOCHS = 3.0
 DATASET_SIZE = 1_115_394
 ITERS_PER_EPOCH = DATASET_SIZE // BATCH
 TOTAL_ITERS = int(ITERS_PER_EPOCH * EPOCHS)
@@ -996,7 +996,8 @@ class CurriculumManager:
         self.promotion_threshold = promotion_threshold
         if total_iterations is not None:
             self.min_iterations_per_stage = max(1, int(total_iterations * 0.05))  
-            self.promotion_patience = max(2, int(total_iterations * 0.03))  
+            # Updated: Increased patience to 10% of total iterations for EMA-based promotion
+            self.promotion_patience = max(2, int(total_iterations * 0.10))  
         else:
             self.promotion_patience = promotion_patience
             self.min_iterations_per_stage = min_iterations_per_stage
@@ -1007,7 +1008,6 @@ class CurriculumManager:
             'loss': float('inf')
         }
         self.iterations_in_stage = 0
-        self.plateau_counter = 0
         self.best_ema_reward = -float('inf')
         self.stage_start_metrics = {}
         boundary_chars = " .,!?:;\n'-\""
@@ -1050,7 +1050,12 @@ class CurriculumManager:
         self.baseline_perplexity_per_stage = {}  
         self.loss_history = deque(maxlen=50)
         self.reward_plateau_counter = 0
-        self.current_perplexity = float('inf')
+        self.current_perplexity = None  # Will be set from initial measurement
+        
+        # EMA history tracking for the new trigger mechanism
+        self.ema_history_window_size = max(1, int(self.promotion_patience))  # 10% of total iterations
+        self.ema_reward_history = deque(maxlen=self.ema_history_window_size)
+        self.ema_improvement_threshold = 0.05  # 5% improvement threshold
     def _compile_stage_configs(self):
         """Pre-compile all stage configurations as tensors"""
         self.stage_configs = {
@@ -1144,9 +1149,14 @@ class CurriculumManager:
             self.loss_history.append(metrics['loss'])
         if 'cross_entropy' in self.ema_metrics:
             self.current_perplexity = self.calculate_perplexity(self.ema_metrics['cross_entropy'])
-        elif 'loss' in self.ema_metrics:
-            # Fallback to loss if cross_entropy not available (shouldn't happen)
-            self.current_perplexity = self.calculate_perplexity(self.ema_metrics['loss'])
+        else:
+            # Keep perplexity as inf if cross_entropy not available yet
+            # This prevents using the wrong loss metric for perplexity
+            pass
+        
+        # Track EMA reward history for the new trigger mechanism
+        self.ema_reward_history.append(self.ema_metrics['reward_mean'])
+        
         self.iterations_in_stage += 1
     def check_promotion(self) -> Tuple[bool, str]:
         """Check if ready to promote to next stage"""
@@ -1165,13 +1175,24 @@ class CurriculumManager:
             if current_perplexity <= target_perplexity:
                 improvement_percent = (1.0 - current_perplexity/self.initial_perplexity) * 100
                 return True, f"perplexity_threshold_met ({current_perplexity:.2f} <= {target_perplexity:.2f}, {improvement_percent:.1f}% improvement)"
-        loss_improvement_rate = self._calculate_loss_improvement_rate()
-        if loss_improvement_rate < 0.01:  
-            self.plateau_counter += 1
-            if self.plateau_counter >= self.promotion_patience:
-                return True, f"loss_plateau_detected (improvement_rate={loss_improvement_rate:.4f})"
-        else:
-            self.plateau_counter = 0
+        
+        # New EMA-based trigger: Check if current EMA crosses 5% above the 20%-ago EMA
+        if len(self.ema_reward_history) >= self.ema_history_window_size:
+            # Get the EMA from 20% iterations ago (oldest in the deque)
+            past_ema_reward = self.ema_reward_history[0]
+            current_ema_reward = self.ema_metrics['reward_mean']
+            
+            # Calculate improvement percentage
+            if abs(past_ema_reward) > 1e-8:  # Avoid division by zero
+                improvement = (current_ema_reward - past_ema_reward) / abs(past_ema_reward)
+                
+                # Trigger promotion if improvement exceeds 5%
+                if improvement >= self.ema_improvement_threshold:
+                    improvement_percent = improvement * 100
+                    return True, f"ema_improvement_trigger ({current_ema_reward:.4f} is {improvement_percent:.1f}% above past EMA {past_ema_reward:.4f})"
+        
+        # Loss plateau detection removed due to issues with negative losses in RL
+        # The other triggers (perplexity, EMA reward, reward plateau) are more reliable
         reward_improvement = (self.ema_metrics['reward_mean'] - self.best_ema_reward) / (abs(self.best_ema_reward) + 1e-8)
         if reward_improvement < self.promotion_threshold:
             self.reward_plateau_counter += 1
@@ -1188,7 +1209,6 @@ class CurriculumManager:
             self.baseline_perplexity_per_stage[self.current_stage + 1] = self.current_perplexity
             self.current_stage += 1
             self.iterations_in_stage = 0
-            self.plateau_counter = 0
             self.best_ema_reward = self.ema_metrics['reward_mean']
             return True
         return False
@@ -1211,7 +1231,6 @@ class CurriculumManager:
             'current_stage': self.current_stage,
             'iterations_in_stage': self.iterations_in_stage,
             'ema_metrics': self.ema_metrics,
-            'plateau_counter': self.plateau_counter,
             'best_ema_reward': self.best_ema_reward,
             'stage_start_metrics': self.stage_start_metrics
         }
@@ -1220,7 +1239,6 @@ class CurriculumManager:
         self.current_stage = state_dict['current_stage']
         self.iterations_in_stage = state_dict['iterations_in_stage']
         self.ema_metrics = state_dict['ema_metrics']
-        self.plateau_counter = state_dict['plateau_counter']
         self.best_ema_reward = state_dict['best_ema_reward']
         self.stage_start_metrics = state_dict['stage_start_metrics']
     def detect_words_gpu(self, sequences: torch.Tensor) -> torch.Tensor:
@@ -1658,7 +1676,9 @@ def train_grpo():
     # kl_controller = AdaptiveKLController(target_kl=0.02)
     kl_controller = None
     confidence_monitor = ConfidenceMonitor() if USE_CONFIDENCE_SCALING else None
-    curriculum_manager = CurriculumManager(device=device, vocab_size=vocab_size, total_iterations=TOTAL_ITERS)
+    # Adjusted EMA/plateau compatibility: Using 5% promotion threshold for better stability
+    curriculum_manager = CurriculumManager(device=device, vocab_size=vocab_size, total_iterations=TOTAL_ITERS,
+                                         promotion_threshold=0.05, ema_alpha=0.95)
     shakespeare_model = None
     char_token_aligner = None
     if curriculum_manager.current_stage >= 3 or any(curriculum_manager.gpt2_kl_weights[s] > 0 for s in range(3, 5)):
@@ -1672,8 +1692,8 @@ def train_grpo():
     if rank == 0:
         import wandb
         wandb.init(
-            project="avataRL_11",
-            name="issue17_1",
+            project="avataRL_12",
+            name="perplexity_fix_2",
             config={
                 "model": {
                     "vocab_size": vocab_size,
@@ -1719,6 +1739,25 @@ def train_grpo():
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
         iter_metrics = defaultdict(list)
+        
+        # Calculate initial cross-entropy for perplexity before first iteration
+        if it == 1:
+            with torch.no_grad():
+                # Get a sample batch to calculate initial perplexity
+                ctx_sample, ref_tok_sample = loader.next()
+                initial_logits = actor(ctx_sample)[:, -HORIZON:]
+                initial_ce = F.cross_entropy(initial_logits.reshape(-1, vocab_size), ref_tok_sample.reshape(-1))
+                iter_metrics["cross_entropy"].append(initial_ce.item())
+                initial_perplexity = torch.exp(initial_ce).item()
+                print_rank0(f"Initial perplexity: {initial_perplexity:.2f} (expected ~65 for random init)", rank)
+                
+                # Set the initial perplexity in curriculum manager
+                curriculum_manager.current_perplexity = initial_perplexity
+                curriculum_manager.initial_perplexity = initial_perplexity
+                curriculum_manager.baseline_perplexity_per_stage[0] = initial_perplexity
+                
+                # Also initialize the EMA metric to avoid inf
+                curriculum_manager.ema_metrics['cross_entropy'] = initial_ce.item()
         for micro_step in range(GRAD_ACCUM):
             ctx, ref_tok = loader.next()
             old_probs = None
@@ -1802,7 +1841,8 @@ def train_grpo():
                 #     current_kl_coef = kl_controller.update(kl.item(), current_kl_coef)
                 kl = torch.tensor(0.0, device=device)  # Placeholder for metrics
                 entropy = new_dist.entropy().mean()
-                entropy_bonus = 0.01  
+                entropy_bonus = ENTROPY_COEF  
+                iter_metrics["entropy"].append(entropy.item())
                 gpt2_kl_penalty_term = torch.tensor(0.0, device=device)
                 if shakespeare_model is not None:
                     gpt2_kl_weight = curriculum_manager.get_gpt2_kl_weight()
@@ -1819,9 +1859,24 @@ def train_grpo():
                 loss = (pol_loss - entropy_bonus * entropy + gpt2_kl_penalty_term) / GRAD_ACCUM
             
             # Calculate cross-entropy loss for perplexity (not used for training)
+            # Fixed: Calculate CE on true data distribution, not generated sequences
             with torch.no_grad():
-                ce_loss = F.cross_entropy(new_logits.reshape(-1, vocab_size), flat_G.reshape(-1))
+                # Get model predictions on true context
+                true_logits = actor(ctx)[:, -HORIZON:]
+                # Calculate CE against true reference tokens
+                ce_loss = F.cross_entropy(true_logits.reshape(-1, vocab_size), ref_tok.reshape(-1))
                 iter_metrics["cross_entropy"].append(ce_loss.item())
+                
+                # Sanity check: perplexity should be > 2.0 for any reasonable model
+                # Random init should give ~65 for 65-char vocabulary
+                perplexity = torch.exp(ce_loss).item()
+                if perplexity < 2.0:
+                    print_rank0(f"WARNING: Suspiciously low perplexity {perplexity:.4f} at iteration {it}. "
+                              f"Expected >2.0 (random init ~65). Check calculation.", rank)
+                
+                # Debug print for first few iterations
+                if it <= 3 and rank == 0:
+                    print(f"[DEBUG] Iteration {it}: CE Loss = {ce_loss.item():.4f}, Perplexity = {perplexity:.4f}")
             
             scaler.scale(loss).backward()
             total_loss += loss.item()
@@ -1893,8 +1948,7 @@ def train_grpo():
                 "curriculum/iterations_in_stage": curriculum_manager.iterations_in_stage,
                 "curriculum/ema_accuracy": curriculum_manager.ema_metrics['accuracy'],
                 "curriculum/ema_reward": curriculum_manager.ema_metrics['reward_mean'],
-                "curriculum/plateau_counter": curriculum_manager.plateau_counter,
-                "curriculum/perplexity": curriculum_manager.current_perplexity,
+                "curriculum/perplexity": curriculum_manager.current_perplexity if curriculum_manager.current_perplexity is not None else float('inf'),
                 "curriculum/perplexity_threshold": curriculum_manager.initial_perplexity * curriculum_manager.perplexity_improvement_thresholds[curriculum_manager.current_stage] if curriculum_manager.initial_perplexity is not None else float('inf'),
                 "curriculum/loss_improvement_rate": curriculum_manager._calculate_loss_improvement_rate(),
             })
