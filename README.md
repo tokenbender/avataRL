@@ -86,6 +86,13 @@ monolith hackable script for modal deployment, just install modal via pip
 
 contributions are welcome! please feel free to submit a pull request.
 
+### development workflow
+
+this project uses standard python linting tools for code quality:
+- flake8 for style checking
+- black for code formatting  
+- isort for import sorting
+
 ## license
 
 this project is licensed under the apache 2.0 license - see the [license](license) file for details.
