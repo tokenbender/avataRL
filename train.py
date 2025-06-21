@@ -5,16 +5,27 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.algorithms.ddp_comm_hooks import default as comm_hooks
-import modal
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 import numpy as np
 import math
 from functools import partial
 from collections import deque
+
+try:
+    import modal
+    MODAL_AVAILABLE = True
+except ImportError:
+    MODAL_AVAILABLE = False
+    modal = None
+
+try:
+    from config import is_modal_environment
+except ImportError:
+    def is_modal_environment():
+        return os.environ.get('TRAINING_MODE', '').lower() == 'modal' or 'MODAL_' in os.environ
 N_GPUS = 8
 GPU_TYPE = "H100"
-app = modal.App("perplexity_fix_2")
 CONTEXT_LEN = 32
 HORIZON = 8
 BATCH = 16384
@@ -56,6 +67,10 @@ USE_LR_DECAY = True
 LR_DECAY_TYPE = "cosine"
 MIN_LR = 1e-5
 WARMUP_ITERS = max(1, int(TOTAL_ITERS * 0.02))
+
+if MODAL_AVAILABLE and is_modal_environment():
+    app = modal.App("perplexity_fix_2")
+
 def norm(x: torch.Tensor) -> torch.Tensor:
     """RMSNorm implementation using PyTorch built-in"""
     return F.rms_norm(x, (x.size(-1),))
@@ -1377,40 +1392,49 @@ def load_checkpoint_all_ranks(
         model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint
-flash_attn_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install("numpy", "torch==2.5.0", "tqdm", "wandb", "requests", "matplotlib", "nvidia-ml-py3")
-    .pip_install(flash_attn_wheel)
-)
-volume = modal.Volume.from_name("grpo-data", create_if_missing=True)
-shakespeare_volume = modal.Volume.from_name("nanogpt-data", create_if_missing=False)
-@app.function(
-    gpu=f"{GPU_TYPE}:{N_GPUS}",
-    volumes={
-        "/data": shakespeare_volume,  # Mount nanogpt-data as /data to access checkpoints
-        "/grpo": volume
-    },
-    timeout=60 * 60 * 6,
-    image=image,
-    secrets=[modal.Secret.from_name("wandb-secret")],
-)
-def train_distributed():
-    """Launch distributed training with torchrun - following modal_nanogpt_simple.py pattern"""
-    import subprocess
-    print(f"Launching distributed training on {N_GPUS} {GPU_TYPE} GPUs")
-    ensure_dataset("input.txt")
-    script_content = Path(__file__).read_text()
-    temp_script = "/tmp/train_multi_gpu.py"
-    Path(temp_script).write_text(script_content)
-    # Stream output in real-time instead of capturing
-    result = subprocess.run([
-        "torchrun", f"--nproc-per-node={N_GPUS}", temp_script
-    ])
+
+if MODAL_AVAILABLE and is_modal_environment():
+    flash_attn_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+    image = (
+        modal.Image.debian_slim(python_version="3.11")
+        .pip_install("numpy", "torch==2.5.0", "tqdm", "wandb", "requests", "matplotlib", "nvidia-ml-py3")
+        .pip_install(flash_attn_wheel)
+    )
+    volume = modal.Volume.from_name("grpo-data", create_if_missing=True)
+    shakespeare_volume = modal.Volume.from_name("nanogpt-data", create_if_missing=False)
     
-    if result.returncode != 0:
-        raise subprocess.CalledProcessError(result.returncode, result.args)
-    return "Distributed training test completed successfully!"
+    @app.function(
+        gpu=f"{GPU_TYPE}:{N_GPUS}",
+        volumes={
+            "/data": shakespeare_volume,
+            "/grpo": volume
+        },
+        timeout=60 * 60 * 6,
+        image=image,
+        secrets=[modal.Secret.from_name("wandb-secret")],
+    )
+    def train_distributed():
+        """Launch distributed training with torchrun - Modal-specific version"""
+        if not MODAL_AVAILABLE:
+            raise ImportError("Modal is not available for distributed training")
+        
+        import subprocess
+        print(f"Launching distributed training on {N_GPUS} {GPU_TYPE} GPUs")
+        ensure_dataset("input.txt")
+        script_content = Path(__file__).read_text()
+        temp_script = "/tmp/train_multi_gpu.py"
+        Path(temp_script).write_text(script_content)
+        
+        env = os.environ.copy()
+        env['TRAINING_MODE'] = 'modal'
+        
+        result = subprocess.run([
+            "torchrun", f"--nproc-per-node={N_GPUS}", temp_script
+        ], env=env)
+        
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, result.args)
+        return "Distributed training test completed successfully!"
 def test_distributed_setup():
     """Test function to verify distributed setup works"""
     try:
@@ -1534,7 +1558,10 @@ def load_shakespeare_checkpoint(device: torch.device, checkpoint_url: str = None
         import requests
         import tempfile
         if checkpoint_url is None:
-            checkpoint_url = "https://modal.com/api/volumes/tokenbender/main/nanogpt-data/files/content?path=checkpoints%2Fshakespeare%2Fckpt.pt"
+            if is_modal_environment():
+                checkpoint_url = "https://modal.com/api/volumes/tokenbender/main/nanogpt-data/files/content?path=checkpoints%2Fshakespeare%2Fckpt.pt"
+            else:
+                checkpoint_url = "https://huggingface.co/gpt2/resolve/main/pytorch_model.bin"
         print(f"[gpt2] Downloading Shakespeare checkpoint...")
         response = requests.get(checkpoint_url, stream=True)
         response.raise_for_status()
@@ -1690,45 +1717,50 @@ def train_grpo():
     # current_kl_coef = BETA_KL  # Disabled - using only Shakespeare model KL
     current_kl_coef = 0.0
     if rank == 0:
-        import wandb
-        wandb.init(
-            project="avataRL_12",
-            name="perplexity_fix_2",
-            config={
-                "model": {
-                    "vocab_size": vocab_size,
-                    "n_layer": N_LAYER,
-                    "n_head": N_HEAD,
-                    "n_emb": N_EMB,
-                    "context_len": CONTEXT_LEN,
-                    "param_count": sum(p.numel() for p in actor.parameters()),
-                },
-                "training": {
-                    "batch_size": BATCH,
-                    "micro_batch_size": MICRO_BATCH,
-                    "grad_accum_steps": GRAD_ACCUM,
-                    "learning_rate": LR,
-                    "epochs": EPOCHS,
-                    "total_iters": TOTAL_ITERS,
-                    "world_size": world_size,
-                },
-                "grpo": {
-                    "use_exhaustive": USE_EXHAUSTIVE,
-                    "k_samples": K_SAMPLES,
-                    "clip_ratio": CLIP_RATIO,
-                    "entropy_coef": ENTROPY_COEF,
-                    "beta_kl": BETA_KL,
-                    "confidence_scaling": USE_CONFIDENCE_SCALING,
-                    "confidence_weight": CONFIDENCE_WEIGHT,
-                },
-                "distributed": {
-                    "n_gpus": N_GPUS,
-                    "gpu_type": GPU_TYPE,
-                    "bucket_size_mb": BUCKET_SIZE_MB,
-                    "gradient_compression": "fp16",
-                },
-            }
-        )
+        try:
+            import wandb
+            use_wandb = os.environ.get('USE_WANDB', 'true').lower() in ('true', '1', 'yes')
+            if use_wandb:
+                wandb.init(
+                    project=os.environ.get('WANDB_PROJECT', "avataRL_12"),
+                    name=os.environ.get('WANDB_NAME', "perplexity_fix_2"),
+                    config={
+                        "model": {
+                            "vocab_size": vocab_size,
+                            "n_layer": N_LAYER,
+                            "n_head": N_HEAD,
+                            "n_emb": N_EMB,
+                            "context_len": CONTEXT_LEN,
+                            "param_count": sum(p.numel() for p in actor.parameters()),
+                        },
+                        "training": {
+                            "batch_size": BATCH,
+                            "micro_batch_size": MICRO_BATCH,
+                            "grad_accum_steps": GRAD_ACCUM,
+                            "learning_rate": LR,
+                            "epochs": EPOCHS,
+                            "total_iters": TOTAL_ITERS,
+                            "world_size": world_size,
+                        },
+                        "grpo": {
+                            "use_exhaustive": USE_EXHAUSTIVE,
+                            "k_samples": K_SAMPLES,
+                            "clip_ratio": CLIP_RATIO,
+                            "entropy_coef": ENTROPY_COEF,
+                            "beta_kl": BETA_KL,
+                            "confidence_scaling": USE_CONFIDENCE_SCALING,
+                            "confidence_weight": CONFIDENCE_WEIGHT,
+                        },
+                        "distributed": {
+                            "n_gpus": N_GPUS,
+                            "gpu_type": GPU_TYPE,
+                            "bucket_size_mb": BUCKET_SIZE_MB,
+                            "gradient_compression": "fp16",
+                        },
+                    }
+                )
+        except ImportError:
+            print("Warning: wandb not available, logging disabled")
     print_rank0(f"Starting training for {TOTAL_ITERS} iterations...", rank)
     from collections import defaultdict
     from tqdm import tqdm
@@ -1920,12 +1952,17 @@ def train_grpo():
                 print(f"[Curriculum] Reason: {promotion_reason}")
                 print(f"[Curriculum] Focus: {stage_config['focus']}")
             if curriculum_manager.current_stage >= 3 and shakespeare_model is None:
-                shakespeare_model = load_shakespeare_reference_model("/data/checkpoints/shakespeare/ckpt.pt", vocab_size, device, rank)
+                checkpoint_path = "/data/checkpoints/shakespeare/ckpt.pt" if is_modal_environment() else "./checkpoints/shakespeare/ckpt.pt"
+                shakespeare_model = load_shakespeare_reference_model(checkpoint_path, vocab_size, device, rank)
                 if shakespeare_model is not None:
                     char_token_aligner = CharTokenAligner(vocab_size, itos, device)
                     print_rank0("[GPT-2 KL] Loaded Shakespeare reference model for stage 3+", rank)
         if rank == 0 and it % 2 == 0:
-            wandb.log({
+            try:
+                import wandb
+                use_wandb = os.environ.get('USE_WANDB', 'true').lower() in ('true', '1', 'yes')
+                if use_wandb:
+                    wandb.log({
                 "loss/total": total_loss * GRAD_ACCUM,
                 "loss/policy": metric_tensors.get("pol_loss", 0),
                 "loss/kl": metric_tensors.get("kl", 0),
@@ -1951,7 +1988,9 @@ def train_grpo():
                 "curriculum/perplexity": curriculum_manager.current_perplexity if curriculum_manager.current_perplexity is not None else float('inf'),
                 "curriculum/perplexity_threshold": curriculum_manager.initial_perplexity * curriculum_manager.perplexity_improvement_thresholds[curriculum_manager.current_stage] if curriculum_manager.initial_perplexity is not None else float('inf'),
                 "curriculum/loss_improvement_rate": curriculum_manager._calculate_loss_improvement_rate(),
-            })
+                    })
+            except ImportError:
+                pass
         # Log every iteration for better visibility
         if rank == 0:
             print(f"Iter {it}: loss={total_loss*GRAD_ACCUM:.4f}, acc={metric_tensors.get('accuracy', 0):.3f}, "
@@ -1987,22 +2026,29 @@ def train_grpo():
             if it % 20 == 0:
                 is_calibrated, calib_error = confidence_monitor.check_calibration()
                 has_collapse, collapse_ratio = confidence_monitor.check_confidence_collapse()
-                wandb.log({
-                    "confidence/calibration_error": calib_error,
-                    "confidence/collapse_ratio": collapse_ratio,
-                    "confidence/is_calibrated": float(is_calibrated),
-                })
+                try:
+                    import wandb
+                    use_wandb = os.environ.get('USE_WANDB', 'true').lower() in ('true', '1', 'yes')
+                    if use_wandb:
+                        wandb.log({
+                            "confidence/calibration_error": calib_error,
+                            "confidence/collapse_ratio": collapse_ratio,
+                            "confidence/is_calibrated": float(is_calibrated),
+                        })
+                except ImportError:
+                    pass
                 if not is_calibrated and rank == 0:
                     print(f"Warning: Model miscalibrated, error={calib_error:.3f}")
                 if has_collapse and rank == 0:
                     print(f"Warning: Confidence collapse detected, ratio={collapse_ratio:.3f}")
     print_rank0("\nTraining completed!", rank)
     if SAVE_FINAL_CHECKPOINT:
+        checkpoint_dir = "/data" if is_modal_environment() else os.environ.get('CHECKPOINT_DIR', './checkpoints')
         save_checkpoint_rank0(
             model=actor,
             optimizer=optimizer,
             iteration=TOTAL_ITERS,
-            checkpoint_path=f"/data/checkpoint_final.pt",
+            checkpoint_path=f"{checkpoint_dir}/checkpoint_final.pt",
             rank=rank,
             additional_state={
                 "chars_seen": chars_seen,
@@ -2011,7 +2057,7 @@ def train_grpo():
                 "curriculum_state": curriculum_manager.get_state_dict(),
             }
         )
-        print_rank0(f"\nFinal checkpoint saved to /data/checkpoint_final.pt", rank)
+        print_rank0(f"\nFinal checkpoint saved to {checkpoint_dir}/checkpoint_final.pt", rank)
     if rank == 0:
         print_rank0("\n=== Generating Sample Text ===", rank)
         print_rank0(f"Model trained for {TOTAL_ITERS} iterations through {curriculum_manager.current_stage + 1} curriculum stages", rank)
@@ -2047,11 +2093,17 @@ def train_grpo():
                 print_rank0(f"Prompt: '{prompt}'", rank)
                 print_rank0(f"Generated: {generated_text}", rank)
                 print_rank0("-" * 40, rank)
-                if i < 4:  
-                    wandb.log({
-                        f"samples/prompt_{i}": prompt,
-                        f"samples/generated_{i}": generated_text,
-                    })
+                if i < 4:
+                    try:
+                        import wandb
+                        use_wandb = os.environ.get('USE_WANDB', 'true').lower() in ('true', '1', 'yes')
+                        if use_wandb:
+                            wandb.log({
+                                f"samples/prompt_{i}": prompt,
+                                f"samples/generated_{i}": generated_text,
+                            })
+                    except ImportError:
+                        pass
         print_rank0("\nUnconditional generation (from empty prompt):", rank)
         print_rank0("=" * 80, rank)
         for i in range(3):
@@ -2069,13 +2121,25 @@ def train_grpo():
             print_rank0(f"\nUnconditional Sample {i+1}:", rank)
             print_rank0(generated_text, rank)
             print_rank0("-" * 40, rank)
-            wandb.log({
-                f"samples/unconditional_{i}": generated_text,
-            })
+            try:
+                import wandb
+                use_wandb = os.environ.get('USE_WANDB', 'true').lower() in ('true', '1', 'yes')
+                if use_wandb:
+                    wandb.log({
+                        f"samples/unconditional_{i}": generated_text,
+                    })
+            except ImportError:
+                pass
         print_rank0("\n" + "=" * 80, rank)
         print_rank0("Sample generation complete!", rank)
     if rank == 0:
-        wandb.finish()
+        try:
+            import wandb
+            use_wandb = os.environ.get('USE_WANDB', 'true').lower() in ('true', '1', 'yes')
+            if use_wandb:
+                wandb.finish()
+        except ImportError:
+            pass
     cleanup_distributed()
 if __name__ == "__main__":
     train_grpo()

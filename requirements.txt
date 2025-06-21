@@ -1,0 +1,16 @@
+# Core dependencies for generic training
+torch>=2.0.0
+numpy
+tqdm
+requests
+
+# Optional dependencies
+wandb  # For experiment tracking
+transformers  # For GPT-2 reference model
+matplotlib  # For visualization
+
+# Flash Attention (install manually if needed)
+# flash-attn>=2.6.0
+
+# Modal (only needed for Modal training)
+# modal
