@@ -168,6 +168,7 @@ claude-workspace/
 *.claude-backup
 *.claude-tmp
 CLAUDE.md
+AGENT.md
 TODO.md
 BRAINSTORM.md
 brainstorm/
@@ -193,4 +194,6 @@ nanogpt/
 
 # bugs, features and experiment tracking
 issues/
+
+# documentation
 docs/
