@@ -413,14 +413,20 @@ def prepare_tinyshakespeare() -> Tuple[str, Dict[str, int], Dict[int, str]]:
     with open(data_path, 'r', encoding='utf-8') as f:
         text = f.read()
     
-    chars = sorted(list(set(text)))
-    vocab_size = len(chars)
-    # Allow flexible vocab size, update the model's vocab size if needed
-    if vocab_size != VOCAB_SIZE:
-        print(f"Warning: Dataset vocab size {vocab_size} differs from config {VOCAB_SIZE}")
-        print(f"Using actual vocab size: {vocab_size}")
+    # Use a fixed character set to ensure consistency across processes
+    # This is the standard Shakespeare character set with 65 characters
+    chars = "\n !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    assert len(chars) == 65, f"Expected 65 chars, got {len(chars)}"
+    
     char_to_idx = {ch: i for i, ch in enumerate(chars)}
     idx_to_char = {i: ch for i, ch in enumerate(chars)}
+    
+    # Verify all text characters are in our charset
+    text_chars = set(text)
+    for ch in text_chars:
+        if ch not in char_to_idx:
+            print(f"Warning: Character '{ch}' (ord={ord(ch)}) not in fixed charset, will be ignored")
+    
     return text, char_to_idx, idx_to_char
 
 
@@ -766,7 +772,7 @@ def evaluate_model(
             # Get random slice of data
             start_idx = torch.randint(0, len(text) - CONTEXT_LEN - 1, (1,)).item()
             chunk = text[start_idx:start_idx + CONTEXT_LEN + 1]
-            indices = [char_to_idx[ch] for ch in chunk]
+            indices = [char_to_idx.get(ch, 0) for ch in chunk]
             x = torch.tensor(indices[:-1], device=device).unsqueeze(0)
             y = torch.tensor(indices[1:], device=device).unsqueeze(0)
             
@@ -778,7 +784,7 @@ def evaluate_model(
     
     # Generate a sample
     context = "KING HENRY VI:"
-    context_indices = [char_to_idx[ch] for ch in context]
+    context_indices = [char_to_idx.get(ch, 0) for ch in context]
     x = torch.tensor(context_indices, device=device).unsqueeze(0)
     
     model.init_kv_caches(batch_size=1, max_seq_len=len(context) + 100, device=device)
@@ -848,10 +854,12 @@ def main(rank: int = 0, world_size: int = 1):
     
     # Load dataset
     text, char_to_idx, idx_to_char = prepare_tinyshakespeare()
-    vocab_size = len(char_to_idx)
     
-    # Create encode function for the data loader
-    encode = lambda s: torch.tensor([char_to_idx[ch] for ch in s], dtype=torch.long)
+    # Use fixed vocab size like the bible
+    vocab_size = 65  # Hardcoded like in train_original.py
+    
+    # Create encode function for the data loader that handles missing characters
+    encode = lambda s: torch.tensor([char_to_idx.get(ch, 0) for ch in s], dtype=torch.long)
     
     # Initialize GPU-resident data loader
     loader = DistributedContextualTextLoader(
