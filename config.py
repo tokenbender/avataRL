@@ -15,7 +15,7 @@ VOCAB_SIZE = 65  # Character-level tokenization
 BATCH = 16384
 MICRO_BATCH = 256  # Reduced to match original for larger model
 GRAD_ACCUM = BATCH // (MICRO_BATCH * N_GPUS)
-EPOCHS = 0.1
+EPOCHS = 1.0
 DATASET_SIZE = 1_115_394
 ITERS_PER_EPOCH = DATASET_SIZE // BATCH
 TOTAL_ITERS = int(ITERS_PER_EPOCH * EPOCHS)
@@ -37,7 +37,7 @@ ENTROPY_COEF = 0.08
 MIN_VARIANCE = 0.1
 
 # Sampling
-K_SAMPLES = 8  # Reduced from 32 for faster training
+K_SAMPLES = 32
 TEMPERATURE = 1.0
 
 # Confidence scaling

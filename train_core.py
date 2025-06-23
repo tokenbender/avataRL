@@ -324,13 +324,14 @@ class TransformerBlock(nn.Module):
 
 class GPT(nn.Module):
     """GPT model with modern architecture"""
-    def __init__(self):
+    def __init__(self, vocab_size: Optional[int] = None):
         super().__init__()
-        self.vocab_size = VOCAB_SIZE
-        self.tok_emb = nn.Embedding(VOCAB_SIZE, N_EMB)
+        # Use provided vocab_size or fall back to config
+        self.vocab_size = vocab_size if vocab_size is not None else VOCAB_SIZE
+        self.tok_emb = nn.Embedding(self.vocab_size, N_EMB)
         self.blocks = nn.ModuleList([TransformerBlock(N_EMB, N_HEAD) for _ in range(N_LAYER)])
         self.final_norm = nn.Identity()
-        self.lm_head = nn.Linear(N_EMB, VOCAB_SIZE, bias=False)
+        self.lm_head = nn.Linear(N_EMB, self.vocab_size, bias=False)
         self.tok_emb.weight = self.lm_head.weight
     
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None, use_cache: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -414,7 +415,10 @@ def prepare_tinyshakespeare() -> Tuple[str, Dict[str, int], Dict[int, str]]:
     
     chars = sorted(list(set(text)))
     vocab_size = len(chars)
-    assert vocab_size == VOCAB_SIZE, f"Vocab size mismatch: {vocab_size} vs {VOCAB_SIZE}"
+    # Allow flexible vocab size, update the model's vocab size if needed
+    if vocab_size != VOCAB_SIZE:
+        print(f"Warning: Dataset vocab size {vocab_size} differs from config {VOCAB_SIZE}")
+        print(f"Using actual vocab size: {vocab_size}")
     char_to_idx = {ch: i for i, ch in enumerate(chars)}
     idx_to_char = {i: ch for i, ch in enumerate(chars)}
     return text, char_to_idx, idx_to_char
@@ -844,6 +848,7 @@ def main(rank: int = 0, world_size: int = 1):
     
     # Load dataset
     text, char_to_idx, idx_to_char = prepare_tinyshakespeare()
+    vocab_size = len(char_to_idx)
     
     # Create encode function for the data loader
     encode = lambda s: torch.tensor([char_to_idx[ch] for ch in s], dtype=torch.long)
@@ -860,9 +865,9 @@ def main(rank: int = 0, world_size: int = 1):
         device=device
     )
     
-    # Initialize models
-    model = GPT().to(device)
-    ref_model = GPT().to(device)
+    # Initialize models with actual vocab size
+    model = GPT(vocab_size=vocab_size).to(device)
+    ref_model = GPT(vocab_size=vocab_size).to(device)
     ref_model.load_state_dict(model.state_dict())
     ref_model.eval()
     for param in ref_model.parameters():
@@ -893,7 +898,7 @@ def main(rank: int = 0, world_size: int = 1):
             name="perplexity_fix_2",
             config={
                 "model": {
-                    "vocab_size": VOCAB_SIZE,
+                    "vocab_size": vocab_size,  # Use actual vocab size
                     "n_layer": N_LAYER,
                     "n_head": N_HEAD,
                     "n_emb": N_EMB,
