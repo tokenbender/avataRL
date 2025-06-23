@@ -434,6 +434,7 @@ def train_step(
     model: nn.Module,
     ref_model: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
     input_ids: torch.Tensor,
     sample_count: int,
     char_to_idx: Dict[str, int],
@@ -608,7 +609,7 @@ def train_step(
                 loss = loss / total_accumulation_steps
                 
                 # Backward pass
-                loss.backward()
+                scaler.scale(loss).backward()
                 
                 total_loss += loss.item() * total_accumulation_steps
                 total_pg_loss += pg_loss.item()
@@ -624,8 +625,10 @@ def train_step(
     
     # Only step optimizer on last accumulation step
     if accumulation_step == total_accumulation_steps - 1:
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         optimizer.zero_grad()
     
     metrics = {
@@ -742,6 +745,9 @@ def main(rank: int = 0, world_size: int = 1):
     device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
+    torch.cuda.set_per_process_memory_fraction(0.95)
     
     # Load dataset
     text, char_to_idx, idx_to_char = prepare_tinyshakespeare()
@@ -762,12 +768,14 @@ def main(rank: int = 0, world_size: int = 1):
     # Setup optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, betas=(0.9, 0.999))
     
+    # Setup gradient scaler for mixed precision
+    scaler = torch.amp.GradScaler('cuda', enabled=True)
+    
     # Training loop
     model.train()
     sample_count = 0
     recent_losses = deque(maxlen=100)
     metrics = {}  # Initialize metrics dict for checkpointing
-    all_metrics = defaultdict(list)
     
     # Initialize wandb on rank 0
     if rank == 0:
@@ -859,6 +867,7 @@ def main(rank: int = 0, world_size: int = 1):
                         model.module if world_size > 1 else model,
                         ref_model,
                         optimizer,
+                        scaler,
                         input_ids,
                         sample_count,
                         char_to_idx,
