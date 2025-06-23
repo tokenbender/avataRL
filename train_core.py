@@ -688,11 +688,12 @@ def train_step(
             ref_log_probs = F.log_softmax(ref_gen_logits, dim=-1)
         
         # KL divergence per sample
+        # Note: F.kl_div expects log probabilities for input and probabilities for target
         kl_div = F.kl_div(
-            gen_log_probs.reshape(-1, VOCAB_SIZE),
-            ref_log_probs.reshape(-1, VOCAB_SIZE).exp(),
+            gen_log_probs,  # [num_selected, H, vocab_size] - log probs
+            ref_log_probs.exp(),  # [num_selected, H, vocab_size] - probs
             reduction='none'
-        ).reshape(num_selected, HORIZON, VOCAB_SIZE).sum(dim=-1).mean(dim=-1)  # [num_selected]
+        ).sum(dim=-1).mean(dim=-1)  # Sum over vocab, mean over horizon -> [num_selected]
         
         # Apply KL free bits
         kl_loss = torch.maximum(kl_div - KL_FREE_FRACTION, torch.tensor(0.0, device=device)).mean()
