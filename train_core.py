@@ -85,6 +85,238 @@ class DistributedContextualTextLoader:
             print(f"Warning: Loading state from rank {state['rank']} to rank {self.rank}")
 
 
+class CurriculumManager:
+    """
+    Manages curriculum learning with staged training based on perplexity tracking.
+    Progressively increases task complexity through 5 stages.
+    """
+    def __init__(self, device: torch.device, vocab_size: int = 65,
+                 ema_alpha: float = 0.95,
+                 promotion_threshold: float = 0.05,
+                 promotion_patience: int = 100,
+                 min_iterations_per_stage: int = 500,
+                 total_iterations: Optional[int] = None):
+        self.device = device
+        self.vocab_size = vocab_size
+        self.current_stage = 0
+        self.stage_iterations = 0
+        self.total_iterations_so_far = 0
+        
+        # EMA tracking
+        self.ema_alpha = ema_alpha
+        self.ema_perplexity = None
+        self.ema_accuracy = None
+        self.ema_reward = None
+        
+        # Promotion criteria
+        self.promotion_threshold = promotion_threshold
+        self.promotion_patience = promotion_patience
+        self.min_iterations_per_stage = min_iterations_per_stage
+        self.patience_counter = 0
+        self.best_ema_perplexity = float('inf')
+        
+        # History tracking
+        self.perplexity_history = deque(maxlen=100)
+        self.accuracy_history = deque(maxlen=100)
+        self.reward_history = deque(maxlen=100)
+        
+        # Stage configurations
+        self.stages = self._setup_stages()
+        
+        # Adaptive timing
+        if total_iterations:
+            self.min_iterations_per_stage = max(int(total_iterations * 0.05), 100)
+            self.promotion_patience = max(int(total_iterations * 0.1 / 5), 50)
+        
+        # Word boundaries for word detection
+        self.word_boundaries = {' ', '\n', '.', ',', '!', '?', ';', ':', '"', "'"}
+        
+        # Stage-specific KL weights
+        self.kl_weights = {
+            0: 0.03,
+            1: 0.05,
+            2: 0.08,
+            3: 0.1,
+            4: 0.1
+        }
+        
+        # Repetition penalty weights by stage
+        self.repetition_weights = {
+            0: 0.0,
+            1: 0.3,
+            2: 0.5,
+            3: 0.7,
+            4: 0.9
+        }
+    
+    def _setup_stages(self) -> Dict:
+        """Define curriculum stages with specific objectives."""
+        return {
+            0: {
+                'name': 'Bigram Foundation',
+                'description': 'Learn character transitions',
+                'word_weights': [0.0, 0.0, 0.0, 0.0, 0.0],
+                'ngram_weight': 1.0,
+                'perplexity_threshold': 0.2,
+                'min_iterations': 500
+            },
+            1: {
+                'name': '2-3 Letter Words',
+                'description': 'Form simple words',
+                'word_weights': [0.1, 0.27, 0.0, 0.0, 0.0],
+                'ngram_weight': 0.7,
+                'perplexity_threshold': 0.15,
+                'min_iterations': 700
+            },
+            2: {
+                'name': '2-4 Letter Words',
+                'description': 'Expand vocabulary',
+                'word_weights': [0.06, 0.16, 0.28, 0.0, 0.0],
+                'ngram_weight': 0.5,
+                'perplexity_threshold': 0.1,
+                'min_iterations': 1000
+            },
+            3: {
+                'name': 'Full Word Spectrum',
+                'description': 'Prioritize word formation',
+                'word_weights': [0.15, 0.41, 0.73, 0.21, 0.0],
+                'ngram_weight': 0.3,
+                'perplexity_threshold': 0.08,
+                'min_iterations': 1500
+            },
+            4: {
+                'name': 'Full Optimization',
+                'description': 'Complete words emphasis',
+                'word_weights': [0.1, 0.27, 0.48, 1.35, 3.5],
+                'ngram_weight': 0.2,
+                'perplexity_threshold': 0.05,
+                'min_iterations': 2000
+            }
+        }
+    
+    def calculate_perplexity(self, loss: float) -> float:
+        """Calculate perplexity from loss with overflow protection."""
+        capped_loss = min(loss, 20.0)
+        return math.exp(capped_loss)
+    
+    def update_metrics(self, metrics: Dict[str, float]):
+        """Update EMA metrics and check for stage promotion."""
+        self.stage_iterations += 1
+        self.total_iterations_so_far += 1
+        
+        # Calculate perplexity
+        perplexity = self.calculate_perplexity(metrics.get('cross_entropy', metrics['loss']))
+        accuracy = metrics.get('accuracy', 0.0)
+        reward = metrics.get('reward_mean', 0.0)
+        
+        # Initialize or update EMAs
+        if self.ema_perplexity is None:
+            self.ema_perplexity = perplexity
+            self.ema_accuracy = accuracy
+            self.ema_reward = reward
+        else:
+            self.ema_perplexity = self.ema_alpha * self.ema_perplexity + (1 - self.ema_alpha) * perplexity
+            self.ema_accuracy = self.ema_alpha * self.ema_accuracy + (1 - self.ema_alpha) * accuracy
+            self.ema_reward = self.ema_alpha * self.ema_reward + (1 - self.ema_alpha) * reward
+        
+        # Track history
+        self.perplexity_history.append(perplexity)
+        self.accuracy_history.append(accuracy)
+        self.reward_history.append(reward)
+        
+        # Check promotion
+        if self._should_promote():
+            self._promote_stage()
+    
+    def _should_promote(self) -> bool:
+        """Check if criteria met for stage promotion."""
+        if self.current_stage >= 4:
+            return False
+        
+        if self.stage_iterations < self.min_iterations_per_stage:
+            return False
+        
+        stage_config = self.stages[self.current_stage]
+        
+        # Check perplexity improvement
+        if self.best_ema_perplexity == float('inf'):
+            self.best_ema_perplexity = self.ema_perplexity
+        
+        improvement = (self.best_ema_perplexity - self.ema_perplexity) / self.best_ema_perplexity
+        
+        if improvement >= stage_config['perplexity_threshold']:
+            return True
+        
+        # Check EMA trigger (5% improvement)
+        if len(self.perplexity_history) >= 50:
+            old_perplexity = sum(list(self.perplexity_history)[:10]) / 10
+            new_perplexity = sum(list(self.perplexity_history)[-10:]) / 10
+            if (old_perplexity - new_perplexity) / old_perplexity >= 0.05:
+                return True
+        
+        # Check plateau
+        if self.ema_perplexity < self.best_ema_perplexity:
+            self.best_ema_perplexity = self.ema_perplexity
+            self.patience_counter = 0
+        else:
+            self.patience_counter += 1
+        
+        return self.patience_counter >= self.promotion_patience
+    
+    def _promote_stage(self):
+        """Promote to next curriculum stage."""
+        self.current_stage = min(self.current_stage + 1, 4)
+        self.stage_iterations = 0
+        self.patience_counter = 0
+        self.best_ema_perplexity = self.ema_perplexity
+        
+        print(f"\n🎓 Promoted to Stage {self.current_stage}: {self.stages[self.current_stage]['name']}")
+        print(f"   EMA Perplexity: {self.ema_perplexity:.4f}")
+        print(f"   Total iterations: {self.total_iterations_so_far}\n")
+    
+    def get_stage_config(self) -> Dict:
+        """Get current stage configuration."""
+        return self.stages[self.current_stage]
+    
+    def get_kl_weight(self) -> float:
+        """Get KL weight for current stage."""
+        return self.kl_weights[self.current_stage]
+    
+    def get_repetition_weight(self) -> float:
+        """Get repetition penalty weight for current stage."""
+        return self.repetition_weights[self.current_stage]
+    
+    def get_state_dict(self) -> Dict:
+        """Save curriculum state for checkpointing."""
+        return {
+            'current_stage': self.current_stage,
+            'stage_iterations': self.stage_iterations,
+            'total_iterations_so_far': self.total_iterations_so_far,
+            'ema_perplexity': self.ema_perplexity,
+            'ema_accuracy': self.ema_accuracy,
+            'ema_reward': self.ema_reward,
+            'best_ema_perplexity': self.best_ema_perplexity,
+            'patience_counter': self.patience_counter,
+            'perplexity_history': list(self.perplexity_history),
+            'accuracy_history': list(self.accuracy_history),
+            'reward_history': list(self.reward_history)
+        }
+    
+    def load_state_dict(self, state: Dict):
+        """Restore curriculum state from checkpoint."""
+        self.current_stage = state['current_stage']
+        self.stage_iterations = state['stage_iterations']
+        self.total_iterations_so_far = state['total_iterations_so_far']
+        self.ema_perplexity = state['ema_perplexity']
+        self.ema_accuracy = state['ema_accuracy']
+        self.ema_reward = state['ema_reward']
+        self.best_ema_perplexity = state['best_ema_perplexity']
+        self.patience_counter = state['patience_counter']
+        self.perplexity_history = deque(state['perplexity_history'], maxlen=100)
+        self.accuracy_history = deque(state['accuracy_history'], maxlen=100)
+        self.reward_history = deque(state['reward_history'], maxlen=100)
+
+
 def norm(x: torch.Tensor) -> torch.Tensor:
     """RMSNorm implementation using PyTorch built-in"""
     return F.rms_norm(x, (x.size(-1),))
@@ -434,11 +666,13 @@ def compute_rewards(
     sequences: torch.Tensor,
     model: nn.Module,
     char_to_idx: Dict[str, int],
-    device: torch.device
+    device: torch.device,
+    curriculum_manager: Optional[CurriculumManager] = None
 ) -> torch.Tensor:
     """
     Enhanced reward function with multi-component scoring.
     Now includes balanced perplexity, repetition penalty, and coherence metrics.
+    Optionally uses curriculum learning for staged rewards.
     """
     B, L = sequences.shape
     rewards = torch.zeros(B, device=device)
@@ -516,7 +750,8 @@ def train_step(
     char_to_idx: Dict[str, int],
     device: torch.device,
     accumulation_step: int,
-    total_accumulation_steps: int
+    total_accumulation_steps: int,
+    curriculum_manager: Optional[CurriculumManager] = None
 ) -> Dict[str, float]:
     """
     Single training step with GRPO algorithm.
@@ -577,7 +812,7 @@ def train_step(
     # Compute rewards for all samples
     rewards_list = []
     for k in range(K_SAMPLES):
-        rewards = compute_rewards(all_sequences[k], model, char_to_idx, device)
+        rewards = compute_rewards(all_sequences[k], model, char_to_idx, device, curriculum_manager)
         rewards_list.append(rewards)
     all_rewards = torch.stack(rewards_list)  # [K, B]
     
@@ -621,7 +856,11 @@ def train_step(
     
     # Now compute losses for selected sequences using BATCHED operations
     model.train()
-    kl_weight = get_kl_weight(sample_count)
+    # Use curriculum KL weight if available, otherwise use global KL weight
+    if curriculum_manager is not None:
+        kl_weight = curriculum_manager.get_kl_weight()
+    else:
+        kl_weight = get_kl_weight(sample_count)
     
     # Flatten sequences for batched processing
     # Instead of K*B individual forward passes, do one batched pass
@@ -734,11 +973,18 @@ def train_step(
         scaler.update()
         optimizer.zero_grad()
     
+    # Compute cross-entropy loss for curriculum tracking
+    with torch.no_grad():
+        # Use the full targets for cross-entropy computation
+        ce_loss = F.cross_entropy(gen_logits.reshape(-1, gen_logits.size(-1)), 
+                                  generated.reshape(-1), reduction='mean')
+    
     metrics = {
         'loss': total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss,
         'pg_loss': pg_loss.item() if isinstance(pg_loss, torch.Tensor) else pg_loss,
         'kl_loss': kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
         'entropy_loss': entropy_loss.item() if isinstance(entropy_loss, torch.Tensor) else entropy_loss,
+        'cross_entropy': ce_loss.item(),  # Add cross-entropy for perplexity tracking
         'reward_mean': all_rewards.mean().item(),
         'reward_std': all_rewards.std().item(),
         'advantage_mean': advantages.mean().item(),
@@ -816,9 +1062,11 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     iteration: int,
     metrics: Dict[str, float],
-    checkpoint_dir: str = "checkpoints"
+    checkpoint_dir: str = "checkpoints",
+    scaler: Optional[torch.amp.GradScaler] = None,
+    curriculum_manager: Optional[CurriculumManager] = None
 ):
-    """Save model checkpoint"""
+    """Save model checkpoint with all training state"""
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint = {
         'iteration': iteration,
@@ -833,6 +1081,15 @@ def save_checkpoint(
             'context_len': CONTEXT_LEN,
         }
     }
+    
+    # Add scaler state if available
+    if scaler is not None:
+        checkpoint['scaler_state_dict'] = scaler.state_dict()
+    
+    # Add curriculum state if available
+    if curriculum_manager is not None:
+        checkpoint['curriculum_state'] = curriculum_manager.get_state_dict()
+    
     checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_iter_{iteration}.pt')
     torch.save(checkpoint, checkpoint_path)
     print(f"Saved checkpoint to {checkpoint_path}")
@@ -840,6 +1097,10 @@ def save_checkpoint(
 
 def main(rank: int = 0, world_size: int = 1):
     """Main training function"""
+    # Set seeds for reproducibility
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    
     # Setup distributed training if needed
     if world_size > 1:
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -887,10 +1148,19 @@ def main(rank: int = 0, world_size: int = 1):
         model.register_comm_hook(dist.group.WORLD, comm_hooks.bf16_compress_hook)
     
     # Setup optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, betas=(0.9, 0.999))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01, betas=(0.9, 0.95))
     
     # Setup gradient scaler for mixed precision
     scaler = torch.amp.GradScaler('cuda', enabled=True)
+    
+    # Initialize curriculum manager
+    curriculum_manager = CurriculumManager(
+        device=device,
+        vocab_size=vocab_size,
+        total_iterations=TOTAL_ITERS,
+        promotion_threshold=0.05,
+        ema_alpha=0.95
+    )
     
     # Training loop
     model.train()
@@ -971,27 +1241,34 @@ def main(rank: int = 0, world_size: int = 1):
                 char_to_idx,
                 device,
                 accum_step,
-                GRAD_ACCUM
+                GRAD_ACCUM,
+                curriculum_manager
             )
             
             sample_count += contexts.shape[0] * world_size
             chars_seen += contexts.shape[0] * CONTEXT_LEN * world_size
             recent_losses.append(metrics['loss'])
         
+        # Update curriculum metrics after each iteration
+        if curriculum_manager is not None:
+            curriculum_manager.update_metrics(metrics)
+        
         # Log metrics every iteration like the bible
         if rank == 0:
+            current_stage = curriculum_manager.current_stage if curriculum_manager else 0
             print(f"Iter {it}: loss={metrics['loss']:.4f}, acc={metrics.get('accuracy', 0):.3f}, "
                   f"kl={metrics.get('kl_loss', 0):.4f}, gpt2_kl={metrics.get('gpt2_kl', 0):.4f}, "
-                  f"stage=0, chars={chars_seen:,}", flush=True)
+                  f"stage={current_stage}, chars={chars_seen:,}", flush=True)
         
         # WandB logging
         if rank == 0 and it % 2 == 0:
-            wandb.log({
+            log_dict = {
                 "iteration": it,
                 "loss/total": metrics['loss'],
                 "loss/policy": metrics['pg_loss'],
                 "loss/kl": metrics['kl_loss'],
                 "loss/entropy": metrics['entropy_loss'],
+                "loss/cross_entropy": metrics.get('cross_entropy', 0),
                 "rewards/mean": metrics['reward_mean'],
                 "rewards/std": metrics['reward_std'],
                 "advantages/mean": metrics['advantage_mean'],
@@ -1000,13 +1277,24 @@ def main(rank: int = 0, world_size: int = 1):
                 "training/kl_weight": metrics['kl_weight'],
                 "training/num_selected": metrics['num_selected'],
                 "training/chars_seen": chars_seen,
-            })
+            }
+            
+            # Add curriculum metrics
+            if curriculum_manager is not None:
+                log_dict.update({
+                    "curriculum/stage": curriculum_manager.current_stage,
+                    "curriculum/perplexity": curriculum_manager.calculate_perplexity(metrics.get('cross_entropy', metrics['loss'])),
+                    "curriculum/ema_perplexity": curriculum_manager.ema_perplexity if curriculum_manager.ema_perplexity is not None else 0,
+                    "curriculum/stage_iterations": curriculum_manager.stage_iterations,
+                })
             
             if USE_CONFIDENCE_SCALING:
-                wandb.log({
+                log_dict.update({
                     "confidence/mean": metrics['confidence_mean'],
                     "confidence/std": metrics['confidence_std'],
                 })
+            
+            wandb.log(log_dict)
         
         # Evaluation
         if rank == 0 and it % 100 == 0:
@@ -1021,14 +1309,18 @@ def main(rank: int = 0, world_size: int = 1):
         if rank == 0 and SAVE_INTERMEDIATE_CHECKPOINTS and it % CHECKPOINT_INTERVAL == 0:
             save_checkpoint(
                 model.module if world_size > 1 else model,
-                optimizer, it, metrics
+                optimizer, it, metrics,
+                scaler=scaler,
+                curriculum_manager=curriculum_manager
             )
     
     # Final checkpoint
     if rank == 0 and SAVE_FINAL_CHECKPOINT:
         save_checkpoint(
             model.module if world_size > 1 else model,
-            optimizer, it, metrics, "checkpoints/final"
+            optimizer, it, metrics, "checkpoints/final",
+            scaler=scaler,
+            curriculum_manager=curriculum_manager
         )
     
     # Finish wandb run
