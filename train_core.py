@@ -609,85 +609,111 @@ def train_step(
         selected_mask.scatter_(0, top_indices, True)
         importance_weights = None
     
-    # Now compute losses for selected sequences
+    # Now compute losses for selected sequences using BATCHED operations
     model.train()
-    total_loss = 0.0
-    total_pg_loss = 0.0
-    total_kl_loss = 0.0
-    total_entropy_loss = 0.0
-    num_selected = selected_mask.sum().item()
-    
     kl_weight = get_kl_weight(sample_count)
     
-    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        for k in range(K_SAMPLES):
-            for b in range(B):
-                if not selected_mask[k, b]:
-                    continue
-                
-                seq = all_sequences[k, b]
-                # Get the generated portion
-                context = seq[:T]
-                generated = seq[T:T+HORIZON]
-                
-                # Forward pass through current model
-                full_input = torch.cat([context[:-1], generated], dim=0).unsqueeze(0)
-                full_target = torch.cat([context[1:], generated], dim=0).unsqueeze(0)
-                
-                logits, _ = model(full_input, full_target)
-                
-                # Compute log probs for generated tokens
-                gen_logits = logits[0, -HORIZON-1:-1]  # Logits for positions that predict generated tokens
-                gen_log_probs = F.log_softmax(gen_logits, dim=-1)
-                selected_log_probs = gen_log_probs.gather(-1, generated.unsqueeze(-1)).squeeze(-1)
-                
-                # PPO-style clipping
-                old_log_probs = all_log_probs[k, b]
-                ratio = torch.exp(selected_log_probs - old_log_probs)
-                clip_ratio = torch.clamp(ratio, 1 - CLIP_RATIO, 1 + CLIP_RATIO)
-                
-                advantage = scaled_advantages[k, b]
-                pg_loss = -torch.min(ratio * advantage, clip_ratio * advantage).mean()
-                
-                # KL divergence with reference model
-                with torch.no_grad():
-                    ref_logits, _ = ref_model(full_input)
-                    ref_log_probs = F.log_softmax(ref_logits[0, -HORIZON-1:-1], dim=-1)
-                
-                kl_div = F.kl_div(gen_log_probs, ref_log_probs.exp(), reduction='batchmean')
-                
-                # Apply KL free bits
-                kl_loss = torch.max(kl_div - KL_FREE_FRACTION, torch.tensor(0.0, device=device))
-                
-                # Entropy regularization
-                probs = gen_log_probs.exp()
-                entropy = -(probs * gen_log_probs).sum(dim=-1).mean()
-                entropy_loss = -ENTROPY_COEF * entropy
-                
-                # Combine losses
-                if importance_weights is not None:
-                    weight = importance_weights[k, b]
-                    loss = weight * (pg_loss + kl_weight * kl_loss + entropy_loss)
-                else:
-                    loss = pg_loss + kl_weight * kl_loss + entropy_loss
-                
-                # Scale by number of accumulation steps
-                loss = loss / total_accumulation_steps
-                
-                # Backward pass
-                scaler.scale(loss).backward()
-                
-                total_loss += loss.item() * total_accumulation_steps
-                total_pg_loss += pg_loss.item()
-                total_kl_loss += kl_loss.item()
-                total_entropy_loss += entropy_loss.item()
+    # Flatten sequences for batched processing
+    # Instead of K*B individual forward passes, do one batched pass
+    flat_sequences = all_sequences.reshape(-1, all_sequences.shape[-1])  # [K*B, T+H]
+    flat_log_probs = all_log_probs.reshape(-1, HORIZON)  # [K*B, H]
+    flat_advantages = scaled_advantages.reshape(-1)  # [K*B]
+    flat_mask = selected_mask.reshape(-1)  # [K*B]
     
-    # Average losses
-    avg_factor = max(num_selected, 1)
-    total_loss /= avg_factor
-    total_pg_loss /= avg_factor
-    total_kl_loss /= avg_factor
-    total_entropy_loss /= avg_factor
+    # Get indices of selected sequences
+    selected_indices = torch.where(flat_mask)[0]
+    num_selected = len(selected_indices)
+    
+    if num_selected == 0:
+        # No sequences selected, return zero metrics
+        return {
+            'loss': 0.0,
+            'pg_loss': 0.0,
+            'kl_loss': 0.0,
+            'entropy_loss': 0.0,
+            'reward_mean': all_rewards.mean().item(),
+            'reward_std': all_rewards.std().item(),
+            'advantage_mean': advantages.mean().item(),
+            'advantage_std': advantages.std().item(),
+            'num_selected': 0,
+            'kl_weight': kl_weight,
+        }
+    
+    # Extract selected sequences for batched processing
+    selected_sequences = flat_sequences[selected_indices]  # [num_selected, T+H]
+    selected_old_log_probs = flat_log_probs[selected_indices]  # [num_selected, H]
+    selected_advantages = flat_advantages[selected_indices]  # [num_selected]
+    
+    # Prepare inputs and targets for batched forward pass
+    contexts = selected_sequences[:, :T]  # [num_selected, T]
+    generated = selected_sequences[:, T:T+HORIZON]  # [num_selected, H]
+    
+    # Construct full inputs and targets
+    full_inputs = torch.cat([contexts[:, :-1], generated], dim=1)  # [num_selected, T-1+H]
+    full_targets = torch.cat([contexts[:, 1:], generated], dim=1)  # [num_selected, T-1+H]
+    
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        # Single batched forward pass through current model
+        logits, _ = model(full_inputs, full_targets)
+        
+        # Extract logits for generated tokens
+        gen_start_idx = T - 1  # Where generated tokens start in the output
+        gen_logits = logits[:, gen_start_idx:gen_start_idx+HORIZON]  # [num_selected, H, vocab_size]
+        
+        # Compute log probs
+        gen_log_probs = F.log_softmax(gen_logits, dim=-1)  # [num_selected, H, vocab_size]
+        
+        # Gather log probs for actually generated tokens
+        generated_expanded = generated.unsqueeze(-1)  # [num_selected, H, 1]
+        selected_log_probs = gen_log_probs.gather(-1, generated_expanded).squeeze(-1)  # [num_selected, H]
+        
+        # PPO-style clipping
+        ratio = torch.exp(selected_log_probs - selected_old_log_probs)  # [num_selected, H]
+        clip_ratio = torch.clamp(ratio, 1 - CLIP_RATIO, 1 + CLIP_RATIO)
+        
+        # Expand advantages for broadcasting
+        advantages_expanded = selected_advantages.unsqueeze(-1)  # [num_selected, 1]
+        
+        # Policy gradient loss
+        pg_loss_per_token = -torch.min(
+            ratio * advantages_expanded,
+            clip_ratio * advantages_expanded
+        )  # [num_selected, H]
+        pg_loss = pg_loss_per_token.mean()
+        
+        # KL divergence with reference model (batched)
+        with torch.no_grad():
+            ref_logits, _ = ref_model(full_inputs)
+            ref_gen_logits = ref_logits[:, gen_start_idx:gen_start_idx+HORIZON]
+            ref_log_probs = F.log_softmax(ref_gen_logits, dim=-1)
+        
+        # KL divergence per sample
+        kl_div = F.kl_div(
+            gen_log_probs.reshape(-1, VOCAB_SIZE),
+            ref_log_probs.reshape(-1, VOCAB_SIZE).exp(),
+            reduction='none'
+        ).reshape(num_selected, HORIZON, VOCAB_SIZE).sum(dim=-1).mean(dim=-1)  # [num_selected]
+        
+        # Apply KL free bits
+        kl_loss = torch.maximum(kl_div - KL_FREE_FRACTION, torch.tensor(0.0, device=device)).mean()
+        
+        # Entropy regularization
+        entropy = -(gen_log_probs.exp() * gen_log_probs).sum(dim=-1).mean()
+        entropy_loss = -ENTROPY_COEF * entropy
+        
+        # Apply importance weights if using exhaustive sampling
+        if importance_weights is not None:
+            # Map back to original K, B indices
+            importance_weights_flat = importance_weights.reshape(-1)[selected_indices]
+            total_loss = (importance_weights_flat * (pg_loss + kl_weight * kl_loss + entropy_loss)).mean()
+        else:
+            total_loss = pg_loss + kl_weight * kl_loss + entropy_loss
+        
+        # Scale by accumulation steps
+        total_loss = total_loss / total_accumulation_steps
+        
+        # Single backward pass for all selected sequences
+        scaler.scale(total_loss).backward()
     
     # Only step optimizer on last accumulation step
     if accumulation_step == total_accumulation_steps - 1:
@@ -698,10 +724,10 @@ def train_step(
         optimizer.zero_grad()
     
     metrics = {
-        'loss': total_loss,
-        'pg_loss': total_pg_loss,
-        'kl_loss': total_kl_loss,
-        'entropy_loss': total_entropy_loss,
+        'loss': total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss,
+        'pg_loss': pg_loss.item() if isinstance(pg_loss, torch.Tensor) else pg_loss,
+        'kl_loss': kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
+        'entropy_loss': entropy_loss.item() if isinstance(entropy_loss, torch.Tensor) else entropy_loss,
         'reward_mean': all_rewards.mean().item(),
         'reward_std': all_rewards.std().item(),
         'advantage_mean': advantages.mean().item(),

@@ -5,21 +5,21 @@ N_GPUS = 8
 GPU_TYPE = "H100"
 
 # Model architecture
-N_LAYER = 2
-N_HEAD = 2
-N_EMB = 64
-CONTEXT_LEN = 32
+N_LAYER = 1
+N_HEAD = 1
+N_EMB = 16
+CONTEXT_LEN = 8
 VOCAB_SIZE = 65  # Character-level tokenization
 
 # Training
 BATCH = 16384
-MICRO_BATCH = 256
+MICRO_BATCH = 512
 GRAD_ACCUM = BATCH // (MICRO_BATCH * N_GPUS)
 EPOCHS = 0.1
 DATASET_SIZE = 1_115_394
 ITERS_PER_EPOCH = DATASET_SIZE // BATCH
 TOTAL_ITERS = int(ITERS_PER_EPOCH * EPOCHS)
-HORIZON = 8
+HORIZON = 1
 
 # Learning rate
 LR = 3e-3
@@ -37,7 +37,7 @@ ENTROPY_COEF = 0.08
 MIN_VARIANCE = 0.1
 
 # Sampling
-K_SAMPLES = 32
+K_SAMPLES = 8  # Reduced from 32 for faster training
 TEMPERATURE = 1.0
 
 # Confidence scaling
