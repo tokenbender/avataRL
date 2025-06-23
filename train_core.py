@@ -12,7 +12,8 @@ from typing import Optional, Tuple, Dict, List
 import numpy as np
 import math
 from functools import partial
-from collections import deque
+from collections import deque, defaultdict
+from tqdm import tqdm
 
 # Import configuration
 from config import *
@@ -326,13 +327,25 @@ def get_kl_weight(sample_count: int) -> float:
 
 def prepare_tinyshakespeare() -> Tuple[str, Dict[str, int], Dict[int, str]]:
     """Load and prepare the TinyShakespeare dataset"""
-    data_path = "tinyshakespeare.txt"
-    if not os.path.exists(data_path):
+    # Check Modal volume path first, then local
+    data_paths = ["/data/input.txt", "input.txt", "tinyshakespeare.txt"]
+    data_path = None
+    
+    for path in data_paths:
+        if os.path.exists(path):
+            data_path = path
+            break
+    
+    if data_path is None:
+        # Download if not found
+        data_path = "input.txt"
         import urllib.request
         url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
         urllib.request.urlretrieve(url, data_path)
-    with open(data_path, 'r') as f:
+    
+    with open(data_path, 'r', encoding='utf-8') as f:
         text = f.read()
+    
     chars = sorted(list(set(text)))
     vocab_size = len(chars)
     assert vocab_size == VOCAB_SIZE, f"Vocab size mismatch: {vocab_size} vs {VOCAB_SIZE}"
@@ -751,95 +764,169 @@ def main(rank: int = 0, world_size: int = 1):
     
     # Training loop
     model.train()
-    iteration = 0
     sample_count = 0
     recent_losses = deque(maxlen=100)
     metrics = {}  # Initialize metrics dict for checkpointing
+    all_metrics = defaultdict(list)
     
+    # Initialize wandb on rank 0
     if rank == 0:
-        print(f"Starting training with {world_size} GPUs...")
-        print(f"Total iterations: {TOTAL_ITERS}")
-        print(f"Gradient accumulation steps: {GRAD_ACCUM}")
+        import wandb
+        wandb.init(
+            project="avataRL_12",
+            name="perplexity_fix_2",
+            config={
+                "model": {
+                    "vocab_size": VOCAB_SIZE,
+                    "n_layer": N_LAYER,
+                    "n_head": N_HEAD,
+                    "n_emb": N_EMB,
+                    "context_len": CONTEXT_LEN,
+                    "param_count": sum(p.numel() for p in model.parameters()),
+                },
+                "training": {
+                    "batch_size": BATCH,
+                    "micro_batch_size": MICRO_BATCH,
+                    "grad_accum_steps": GRAD_ACCUM,
+                    "learning_rate": LR,
+                    "epochs": EPOCHS,
+                    "total_iters": TOTAL_ITERS,
+                    "world_size": world_size,
+                },
+                "grpo": {
+                    "use_exhaustive": USE_EXHAUSTIVE,
+                    "k_samples": K_SAMPLES,
+                    "clip_ratio": CLIP_RATIO,
+                    "entropy_coef": ENTROPY_COEF,
+                    "beta_kl": BETA_KL,
+                    "confidence_scaling": USE_CONFIDENCE_SCALING,
+                    "confidence_weight": CONFIDENCE_WEIGHT,
+                },
+                "distributed": {
+                    "n_gpus": N_GPUS,
+                    "gpu_type": GPU_TYPE,
+                    "bucket_size_mb": BUCKET_SIZE_MB,
+                    "gradient_compression": "fp16",
+                },
+            }
+        )
+        print(f"Starting training with {world_size} GPUs...", flush=True)
+        print(f"Total iterations: {TOTAL_ITERS}", flush=True)
+        print(f"Gradient accumulation steps: {GRAD_ACCUM}", flush=True)
     
-    for epoch in range(int(EPOCHS)):
-        # Shuffle data
-        indices = list(range(len(text) - CONTEXT_LEN))
-        np.random.shuffle(indices)
+    # Prepare initial data indices
+    indices = list(range(len(text) - CONTEXT_LEN))
+    np.random.shuffle(indices)
+    chars_seen = 0
+    
+    # Use tqdm for progress tracking on rank 0
+    for it in tqdm(range(1, TOTAL_ITERS + 1), desc="Training", disable=(rank != 0)):
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
         
-        for i in range(0, len(indices) - BATCH, BATCH):
-            # Prepare batch across accumulation steps
-            for accum_step in range(GRAD_ACCUM):
-                micro_batch_indices = indices[
-                    i + accum_step * MICRO_BATCH * world_size:
-                    i + (accum_step + 1) * MICRO_BATCH * world_size
-                ]
+        # Prepare batch across accumulation steps
+        for accum_step in range(GRAD_ACCUM):
+            # Calculate batch indices
+            batch_idx = ((it - 1) * BATCH + accum_step * MICRO_BATCH * world_size) % len(indices)
+            micro_batch_indices = indices[batch_idx:batch_idx + MICRO_BATCH * world_size]
+            
+            # Wrap around if needed
+            if len(micro_batch_indices) < MICRO_BATCH * world_size:
+                np.random.shuffle(indices)
+                additional_needed = MICRO_BATCH * world_size - len(micro_batch_indices)
+                micro_batch_indices = micro_batch_indices + indices[:additional_needed]
+            
+            if rank < len(micro_batch_indices):
+                # Get micro batch for this rank
+                rank_indices = micro_batch_indices[rank::world_size]
                 
-                if rank < len(micro_batch_indices):
-                    # Get micro batch for this rank
-                    rank_indices = micro_batch_indices[rank::world_size]
+                batch_inputs = []
+                for idx in rank_indices[:MICRO_BATCH]:
+                    chunk = text[idx:idx + CONTEXT_LEN]
+                    input_ids = [char_to_idx[ch] for ch in chunk]
+                    batch_inputs.append(input_ids)
+                
+                if batch_inputs:
+                    input_ids = torch.tensor(batch_inputs, device=device)
                     
-                    batch_inputs = []
-                    for idx in rank_indices[:MICRO_BATCH]:
-                        chunk = text[idx:idx + CONTEXT_LEN]
-                        input_ids = [char_to_idx[ch] for ch in chunk]
-                        batch_inputs.append(input_ids)
+                    # Update learning rate
+                    lr = get_lr(it)
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = lr
                     
-                    if batch_inputs:
-                        input_ids = torch.tensor(batch_inputs, device=device)
-                        
-                        # Update learning rate
-                        lr = get_lr(iteration)
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] = lr
-                        
-                        # Training step
-                        metrics = train_step(
-                            model.module if world_size > 1 else model,
-                            ref_model,
-                            optimizer,
-                            input_ids,
-                            sample_count,
-                            char_to_idx,
-                            device,
-                            accum_step,
-                            GRAD_ACCUM
-                        )
-                        
-                        sample_count += input_ids.shape[0] * world_size
-                        recent_losses.append(metrics['loss'])
+                    # Training step
+                    metrics = train_step(
+                        model.module if world_size > 1 else model,
+                        ref_model,
+                        optimizer,
+                        input_ids,
+                        sample_count,
+                        char_to_idx,
+                        device,
+                        accum_step,
+                        GRAD_ACCUM
+                    )
+                    
+                    sample_count += input_ids.shape[0] * world_size
+                    chars_seen += input_ids.shape[0] * CONTEXT_LEN * world_size
+                    recent_losses.append(metrics['loss'])
+        
+        # Log metrics every iteration like the bible
+        if rank == 0:
+            print(f"Iter {it}: loss={metrics['loss']:.4f}, acc={metrics.get('accuracy', 0):.3f}, "
+                  f"kl={metrics.get('kl_loss', 0):.4f}, gpt2_kl={metrics.get('gpt2_kl', 0):.4f}, "
+                  f"stage=0, chars={chars_seen:,}", flush=True)
+        
+        # WandB logging
+        if rank == 0 and it % 2 == 0:
+            wandb.log({
+                "iteration": it,
+                "loss/total": metrics['loss'],
+                "loss/policy": metrics['pg_loss'],
+                "loss/kl": metrics['kl_loss'],
+                "loss/entropy": metrics['entropy_loss'],
+                "rewards/mean": metrics['reward_mean'],
+                "rewards/std": metrics['reward_std'],
+                "advantages/mean": metrics['advantage_mean'],
+                "advantages/std": metrics['advantage_std'],
+                "training/lr": lr,
+                "training/kl_weight": metrics['kl_weight'],
+                "training/num_selected": metrics['num_selected'],
+                "training/chars_seen": chars_seen,
+            })
             
-            iteration += 1
-            
-            # Logging
-            if rank == 0 and iteration % 10 == 0:
-                avg_loss = sum(recent_losses) / len(recent_losses)
-                print(f"Iter {iteration}/{TOTAL_ITERS} | Loss: {avg_loss:.4f} | "
-                      f"PG: {metrics['pg_loss']:.4f} | KL: {metrics['kl_loss']:.4f} | "
-                      f"Reward: {metrics['reward_mean']:.3f}±{metrics['reward_std']:.3f} | "
-                      f"LR: {lr:.2e}")
-            
-            # Evaluation
-            if rank == 0 and iteration % 100 == 0:
-                eval_metrics = evaluate_model(
-                    model.module if world_size > 1 else model,
-                    text, char_to_idx, idx_to_char, device
-                )
-                print(f"\n[Eval] Perplexity: {eval_metrics['perplexity']:.2f}")
-                print(f"Sample: {eval_metrics['sample'][:200]}...\n")
-            
-            # Checkpointing
-            if rank == 0 and SAVE_INTERMEDIATE_CHECKPOINTS and iteration % CHECKPOINT_INTERVAL == 0:
-                save_checkpoint(
-                    model.module if world_size > 1 else model,
-                    optimizer, iteration, metrics
-                )
+            if USE_CONFIDENCE_SCALING:
+                wandb.log({
+                    "confidence/mean": metrics['confidence_mean'],
+                    "confidence/std": metrics['confidence_std'],
+                })
+        
+        # Evaluation
+        if rank == 0 and it % 100 == 0:
+            eval_metrics = evaluate_model(
+                model.module if world_size > 1 else model,
+                text, char_to_idx, idx_to_char, device
+            )
+            print(f"\n[Eval] Perplexity: {eval_metrics['perplexity']:.2f}")
+            print(f"Sample: {eval_metrics['sample'][:200]}...\n")
+        
+        # Checkpointing
+        if rank == 0 and SAVE_INTERMEDIATE_CHECKPOINTS and it % CHECKPOINT_INTERVAL == 0:
+            save_checkpoint(
+                model.module if world_size > 1 else model,
+                optimizer, it, metrics
+            )
     
     # Final checkpoint
     if rank == 0 and SAVE_FINAL_CHECKPOINT:
         save_checkpoint(
             model.module if world_size > 1 else model,
-            optimizer, iteration, metrics, "checkpoints/final"
+            optimizer, it, metrics, "checkpoints/final"
         )
+    
+    # Finish wandb run
+    if rank == 0:
+        wandb.finish()
     
     if world_size > 1:
         dist.destroy_process_group()

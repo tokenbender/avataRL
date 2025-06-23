@@ -60,10 +60,14 @@ if __name__ == "__main__":
     with open("/tmp/train_wrapper.py", "w") as f:
         f.write(wrapper_script)
     
-    # Run with torchrun
+    # Set environment variables for proper output
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"  # Ensure unbuffered output
+    
+    # Run with torchrun, streaming output to console
     result = subprocess.run([
         "torchrun", f"--nproc-per-node={N_GPUS}", "/tmp/train_wrapper.py"
-    ])
+    ], env=env, stdout=None, stderr=None)  # None means inherit from parent
     
     if result.returncode != 0:
         raise subprocess.CalledProcessError(result.returncode, result.args)
