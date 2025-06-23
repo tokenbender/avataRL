@@ -197,3 +197,6 @@ issues/
 
 # documentation
 docs/
+
+# Performance analysis files
+PERFORMANCE_BOTTLENECKS.md

@@ -9,7 +9,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.algorithms.ddp_comm_hooks import default as comm_hooks
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
-import numpy as np
 import math
 from functools import partial
 from collections import deque, defaultdict
@@ -17,6 +16,73 @@ from tqdm import tqdm
 
 # Import configuration
 from config import *
+
+
+class DistributedContextualTextLoader:
+    """
+    GPU-resident data loader for GRPO training
+    - Data is loaded ONCE to GPU and stays there
+    - Each GPU gets the full dataset but starts at different positions
+    - Provides contextual windows for next-token prediction
+    """
+    def __init__(self, text: str, encode_fn, batch_size: int, horizon: int, 
+                 context_len: int, rank: int, world_size: int, device: torch.device):
+        # Load and encode data ONCE to GPU
+        self.data = encode_fn(text).to(device)
+        self.batch_size = batch_size
+        self.horizon = horizon
+        self.context_len = context_len
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        
+        # Calculate starting position for this rank
+        total_len = len(self.data)
+        offset_per_rank = (total_len - context_len - batch_size * horizon) // max(1, world_size)
+        self.pos = context_len + (rank * offset_per_rank)
+        
+        # Ensure we don't go past the end
+        max_start = total_len - batch_size * horizon - 1
+        self.pos = min(self.pos, max_start)
+    
+    def next(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get next batch - data stays on GPU"""
+        # Wrap around if we reach the end
+        if self.pos + self.batch_size * self.horizon + 1 > len(self.data):
+            self.pos = self.context_len
+        
+        contexts = []
+        targets = []
+        
+        for b in range(self.batch_size):
+            ctx_start = self.pos - self.context_len + b * self.horizon
+            ctx_end = self.pos + b * self.horizon
+            
+            # All operations on GPU-resident data
+            context = self.data[ctx_start:ctx_end]
+            target = self.data[ctx_end:ctx_end + self.horizon]
+            
+            contexts.append(context)
+            targets.append(target)
+        
+        # Move position forward
+        self.pos += self.batch_size * self.horizon
+        
+        # Stack on GPU
+        return torch.stack(contexts), torch.stack(targets)
+    
+    def state_dict(self) -> Dict:
+        """Save loader state for checkpointing"""
+        return {
+            'pos': self.pos,
+            'rank': self.rank
+        }
+    
+    def load_state_dict(self, state: Dict):
+        """Restore loader state from checkpoint"""
+        self.pos = state['pos']
+        if state['rank'] != self.rank:
+            print(f"Warning: Loading state from rank {state['rank']} to rank {self.rank}")
 
 
 def norm(x: torch.Tensor) -> torch.Tensor:
@@ -752,6 +818,21 @@ def main(rank: int = 0, world_size: int = 1):
     # Load dataset
     text, char_to_idx, idx_to_char = prepare_tinyshakespeare()
     
+    # Create encode function for the data loader
+    encode = lambda s: torch.tensor([char_to_idx[ch] for ch in s], dtype=torch.long)
+    
+    # Initialize GPU-resident data loader
+    loader = DistributedContextualTextLoader(
+        text=text,
+        encode_fn=encode,
+        batch_size=MICRO_BATCH,
+        horizon=HORIZON,
+        context_len=CONTEXT_LEN,
+        rank=rank,
+        world_size=world_size,
+        device=device
+    )
+    
     # Initialize models
     model = GPT().to(device)
     ref_model = GPT().to(device)
@@ -822,9 +903,6 @@ def main(rank: int = 0, world_size: int = 1):
         print(f"Total iterations: {TOTAL_ITERS}", flush=True)
         print(f"Gradient accumulation steps: {GRAD_ACCUM}", flush=True)
     
-    # Prepare initial data indices
-    indices = list(range(len(text) - CONTEXT_LEN))
-    np.random.shuffle(indices)
     chars_seen = 0
     
     # Use tqdm for progress tracking on rank 0
@@ -834,51 +912,31 @@ def main(rank: int = 0, world_size: int = 1):
         
         # Prepare batch across accumulation steps
         for accum_step in range(GRAD_ACCUM):
-            # Calculate batch indices
-            batch_idx = ((it - 1) * BATCH + accum_step * MICRO_BATCH * world_size) % len(indices)
-            micro_batch_indices = indices[batch_idx:batch_idx + MICRO_BATCH * world_size]
+            # Get batch from GPU-resident data loader
+            contexts, _ = loader.next()  # targets not needed for GRPO
             
-            # Wrap around if needed
-            if len(micro_batch_indices) < MICRO_BATCH * world_size:
-                np.random.shuffle(indices)
-                additional_needed = MICRO_BATCH * world_size - len(micro_batch_indices)
-                micro_batch_indices = micro_batch_indices + indices[:additional_needed]
+            # Update learning rate
+            lr = get_lr(it)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
             
-            if rank < len(micro_batch_indices):
-                # Get micro batch for this rank
-                rank_indices = micro_batch_indices[rank::world_size]
-                
-                batch_inputs = []
-                for idx in rank_indices[:MICRO_BATCH]:
-                    chunk = text[idx:idx + CONTEXT_LEN]
-                    input_ids = [char_to_idx[ch] for ch in chunk]
-                    batch_inputs.append(input_ids)
-                
-                if batch_inputs:
-                    input_ids = torch.tensor(batch_inputs, device=device)
-                    
-                    # Update learning rate
-                    lr = get_lr(it)
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = lr
-                    
-                    # Training step
-                    metrics = train_step(
-                        model.module if world_size > 1 else model,
-                        ref_model,
-                        optimizer,
-                        scaler,
-                        input_ids,
-                        sample_count,
-                        char_to_idx,
-                        device,
-                        accum_step,
-                        GRAD_ACCUM
-                    )
-                    
-                    sample_count += input_ids.shape[0] * world_size
-                    chars_seen += input_ids.shape[0] * CONTEXT_LEN * world_size
-                    recent_losses.append(metrics['loss'])
+            # Training step with contexts as input
+            metrics = train_step(
+                model.module if world_size > 1 else model,
+                ref_model,
+                optimizer,
+                scaler,
+                contexts,  # Already on GPU
+                sample_count,
+                char_to_idx,
+                device,
+                accum_step,
+                GRAD_ACCUM
+            )
+            
+            sample_count += contexts.shape[0] * world_size
+            chars_seen += contexts.shape[0] * CONTEXT_LEN * world_size
+            recent_losses.append(metrics['loss'])
         
         # Log metrics every iteration like the bible
         if rank == 0:
