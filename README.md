@@ -1,6 +1,6 @@
-# avataRL
+# avatarl
 
-training a tinyshakespeare model -> zero pretrain, all rl baby.
+training a tinyshakespeare model from random initialization using pure reinforcement learning - no cross entropy loss based pretraining.
 
 ## overview
 
@@ -20,11 +20,10 @@ and we might be creating lots of unorthodox things here, as any fun loving man s
 
 ## key features
 
-- custom implementation with performance-focused design choices
-- implementation of group relative policy optimization for improved training stability with ppo style clipping and entropy minimisation
-- flash attention
-- rmsnorm instead of layernorm
-- tight memory management
+- **improved distributed training with GRPO**: optimized from 27-30min to 2min50s per run per epoch
+- **distributed training**: supports both single-gpu and multi-gpu setups via torchrun
+- **bootstrapping with ngram** rewards: starts with bigram rewards and ramps up to trigrams, etc.
+- **curriculum learning**: stagewise rewards for testing language understanding, adaptive kl penalty for stable convergence
 
 ## implementation details
 
@@ -32,19 +31,17 @@ and we might be creating lots of unorthodox things here, as any fun loving man s
 our grpo implementation extends beyond typical reference implementations (like [tiny-grpo](https://github.com/open-thought/tiny-grpo))
 
 #### architectural optimizations
-- **rmsnorm instead of layernorm**: custom rms normalization for ~2x faster normalization
+- **model configuration**: 6 layers, 6 attention heads, 384 embedding dimension (~10m parameters)
 - **fused qkv projection**: single linear layer for q,k,v instead of separate projections
-- **flash attention 2 integration**: o(n) memory complexity for attention computation
 - **pre-norm architecture**: applies normalization before attention/ffn blocks for better stability
 - **weight tying**: shares weights between input embeddings and output projection
-- **gelu with tanh approximation**: faster activation function without accuracy loss
 
 #### custom training techniques
-- **temperature-based sampling** (t=1.2): controls generation diversity during rollouts
-- **k-sample generation** (k=4): generates multiple samples per context for better advantage estimation
+- **temperature-based sampling**: controls generation diversity during rollouts
+- **k-sample generation**: generates multiple samples per context for better advantage estimation
 - **adaptive kl coefficient**: dynamically adjusts kl penalty based on divergence history
-- **ppo-style clipping** (ratio=0.5): prevents destructive policy updates
-- **entropy regularization** (coef=0.01): encourages exploration during training
+- **ppo-style clipping**: prevents destructive policy updates
+- **entropy regularization**: encourages exploration during training
 - **minimum variance threshold**: prevents numerical instability in advantage normalization
 
 #### features beyond standard grpo
@@ -77,7 +74,7 @@ monolith hackable script for modal deployment, just install modal via pip
 
 **30may25** so i figured i could ramp up the ngrams. trigram after bigram and so on, but this approach is going to scale badly. so i decided to think deeper on this. since i need to run many experiments with limited personal budget, i improved speed from 27-30min previously to 2min50s current. now i can do 10x more experiments and it is a good base.
 
-**03june25** shared insights on the progress made in bootstrapping a random weights system with rl pretrain in BOOTSTRAPPING md file.
+**03june25** shared insights on the progress made in bootstrapping a random weights system with rl pretrain in bootstrapping md file.
 
 **current** bridge the gap between bootstrapped level of performance and groundtruth accuracy.
 
