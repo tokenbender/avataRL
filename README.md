@@ -20,7 +20,7 @@ and we might be creating lots of unorthodox things here, as any fun loving man s
 
 ## key features
 
-- **improved distributed training with GRPO**: optimized from 27-30min to 2min50s per run per epoch
+- **improved distributed training with grpo**: optimized from 27-30min to 2min50s per run per epoch
 - **distributed training**: supports both single-gpu and multi-gpu setups via torchrun
 - **bootstrapping with ngram** rewards: starts with bigram rewards and ramps up to trigrams, etc.
 - **curriculum learning**: stagewise rewards for testing language understanding, adaptive kl penalty for stable convergence
@@ -59,12 +59,51 @@ our grpo implementation extends beyond typical reference implementations (like [
 
 ## requirements
 
-- python 3.8+
-- pytorch 2.0+
-- flash attention 2
+- python 3.11 (recommended for modal parity)
+- pytorch 2.5.0
+- flash attention 2.6.3
+- cuda-capable gpu (a100/h100 recommended)
 
-## installation
-monolith hackable script for modal deployment, just install modal via pip
+## quick start
+
+### server setup (recommended)
+```bash
+# 1. run automated setup script
+bash setup_server.sh
+
+# 2. use generated launch scripts
+./launch_single_gpu.sh    # for single gpu
+./launch_multi_gpu.sh     # auto-detects and uses all gpus
+```
+
+the setup script will:
+- verify cuda/gpu availability
+- create python 3.11 virtual environment
+- install pytorch 2.5.0 with appropriate cuda support
+- install flash attention 2.6.3 (precompiled or from source)
+- download tinyshakespeare dataset
+- create convenient launch scripts
+
+### manual installation
+```bash
+# create virtual environment
+python3.11 -m venv venv
+source venv/bin/activate
+
+# install dependencies (cuda 12.x)
+pip install torch==2.5.0 --index-url https://download.pytorch.org/whl/cu124
+pip install numpy tqdm wandb requests matplotlib nvidia-ml-py3
+pip install flash-attn==2.6.3 --no-build-isolation
+
+# download dataset
+wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+```
+
+### modal deployment
+```bash
+pip install modal
+modal run train_modal.py
+```
 
 
 ## progress
