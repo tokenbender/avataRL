@@ -199,4 +199,7 @@ issues/
 docs/
 
 # Performance analysis files
-PERFORMANCE_BOTTLENECKS.mdtemp/
+PERFORMANCE_BOTTLENECKS.md
+
+# Temporary files
+temp/
