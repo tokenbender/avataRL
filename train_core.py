@@ -16,6 +16,126 @@ from tqdm import tqdm
 
 # Import configuration
 from config import *
+import numpy as np
+
+# Global tokenizer cache
+_tokenizer = None
+
+
+def check_tokenizer_exists(vocab_size: int = VOCAB_SIZE) -> bool:
+    """Check if the BPE tokenizer exists and provide instructions if not."""
+    # Check Modal volume path first, then local paths
+    tokenizer_paths = [
+        f"/data/{TOKENIZER_DIR}/shakespeare-bpe-{vocab_size}.json",
+        os.path.join(DATA_ROOT, TOKENIZER_DIR, f"shakespeare-bpe-{vocab_size}.json")
+    ]
+    
+    for path in tokenizer_paths:
+        if os.path.exists(path):
+            return True
+    
+    print(f"\n{'='*60}")
+    print(f"ERROR: BPE tokenizer not found!")
+    print(f"{'='*60}")
+    print(f"Expected tokenizer at one of:")
+    for path in tokenizer_paths:
+        print(f"  - {path}")
+    print(f"\nTo create the tokenizer:")
+    print(f"  1. Install tokenizers: pip install tokenizers")
+    print(f"  2. Run: python create_tokenizer_example.py --vocab-size {vocab_size}")
+    print(f"\nOr if using Modal:")
+    print(f"  modal run train_tokenizer_modal.py::train_bpe_tokenizer")
+    print(f"{'='*60}\n")
+    return False
+
+
+def load_bpe_tokenizer(vocab_size: int = VOCAB_SIZE):
+    """Load BPE tokenizer from Modal volume or local path."""
+    global _tokenizer
+    
+    if _tokenizer is not None:
+        return _tokenizer
+    
+    try:
+        from tokenizers import Tokenizer
+    except ImportError:
+        raise ImportError(
+            "tokenizers library not installed. "
+            "Install with: pip install tokenizers"
+        )
+    
+    # Check Modal volume path first, then local paths
+    tokenizer_paths = [
+        f"/data/{TOKENIZER_DIR}/shakespeare-bpe-{vocab_size}.json",
+        os.path.join(DATA_ROOT, TOKENIZER_DIR, f"shakespeare-bpe-{vocab_size}.json")
+    ]
+    
+    tokenizer_path = None
+    for path in tokenizer_paths:
+        if os.path.exists(path):
+            tokenizer_path = path
+            break
+    
+    if tokenizer_path is None:
+        if not check_tokenizer_exists(vocab_size):
+            raise FileNotFoundError(
+                f"BPE tokenizer not found for vocab_size={vocab_size}"
+            )
+    
+    _tokenizer = Tokenizer.from_file(tokenizer_path)
+    print(f"Loaded BPE tokenizer from {tokenizer_path}")
+    print(f"Vocabulary size: {_tokenizer.get_vocab_size()}")
+    
+    return _tokenizer
+
+
+def load_pretokenized_data(vocab_size: int = VOCAB_SIZE, split: str = "train") -> np.ndarray:
+    """Load pre-tokenized binary data from Modal volume or local path.
+    
+    Args:
+        vocab_size: BPE vocabulary size
+        split: 'train' or 'val'
+    
+    Returns:
+        Memory-mapped numpy array of token IDs (uint16 format)
+    """
+    # Format the tokenized data directory name
+    data_dir_name = TOKENIZED_DATA_DIR.format(vocab_size=vocab_size)
+    
+    # Check Modal volume path first, then local paths
+    data_paths = [
+        f"/data/{data_dir_name}/{split}.bin",
+        os.path.join(DATA_ROOT, data_dir_name, f"{split}.bin")
+    ]
+    
+    data_path = None
+    for path in data_paths:
+        if os.path.exists(path):
+            data_path = path
+            break
+    
+    if data_path is None:
+        print(f"\n{'='*60}")
+        print(f"ERROR: Pre-tokenized data not found!")
+        print(f"{'='*60}")
+        print(f"Expected {split}.bin at one of:")
+        for path in data_paths:
+            print(f"  - {path}")
+        print(f"\nTo create tokenized data:")
+        print(f"  1. Ensure you have the BPE tokenizer (vocab_size={vocab_size})")
+        print(f"  2. Run tokenization script or use Modal:")
+        print(f"     modal run prepare_data.py")
+        print(f"{'='*60}\n")
+        raise FileNotFoundError(
+            f"Pre-tokenized {split} data not found for vocab_size={vocab_size}"
+        )
+    
+    # Load as memory-mapped array for efficiency
+    data = np.memmap(data_path, dtype=np.uint16, mode='r')
+    print(f"Loaded {split} data from {data_path}")
+    print(f"Total tokens: {len(data):,}")
+    
+    return data
 
 
 class DistributedContextualTextLoader:
