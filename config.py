@@ -5,11 +5,19 @@ N_GPUS = 8
 GPU_TYPE = "H100"
 
 # Model architecture
-N_LAYER = 6  # Increased from 1 to match original
-N_HEAD = 6   # Increased from 1 to match original
-N_EMB = 384  # Increased from 16 to match original
-CONTEXT_LEN = 32  # Increased from 8 to match original
-VOCAB_SIZE = 65  # Character-level tokenization
+N_LAYER = 6
+N_HEAD = 6
+N_EMB = 384
+CONTEXT_LEN = 32
+
+# Data configuration
+VOCAB_SIZE = 1024            # BPE vocabulary size
+DATA_ROOT = "./data"         # Root directory for data files
+MODAL_VOLUME = "nanogpt-data" # Modal volume name for cloud deployments
+
+# Tokenizer paths (relative to DATA_ROOT or MODAL_VOLUME)
+TOKENIZER_DIR = "tokenizers"
+TOKENIZED_DATA_DIR = "shakespeare_tokens_bpe{vocab_size}"  # Will be formatted with vocab_size
 
 # Training
 BATCH = 16384
