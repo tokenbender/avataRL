@@ -9,7 +9,7 @@ flash_attn_wheel = "https://github.com/Dao-AILab/flash-attention/releases/downlo
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("packaging", "wheel", "setuptools")
-    .pip_install("numpy", "torch==2.5.0", "tqdm", "wandb", "requests", "matplotlib", "nvidia-ml-py3")
+    .pip_install("numpy", "torch==2.5.0", "tqdm", "wandb", "requests", "matplotlib", "nvidia-ml-py3", "tokenizers")
     .pip_install(flash_attn_wheel)
     .add_local_file("train_core.py", "/root/train_core.py")
     .add_local_file("config.py", "/root/config.py")
@@ -26,7 +26,7 @@ shakespeare_volume = modal.Volume.from_name("nanogpt-data", create_if_missing=Fa
     },
     timeout=60 * 60 * 6,
     image=image,
-    secrets=[modal.Secret.from_name("wandb-secret")],
+    secrets=[modal.Secret.from_name("wandb")],
 )
 def train_distributed():
     """Launch distributed training with torchrun"""

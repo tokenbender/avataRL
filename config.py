@@ -5,10 +5,10 @@ N_GPUS = 8
 GPU_TYPE = "H100"
 
 # Model architecture
-N_LAYER = 6
-N_HEAD = 6
-N_EMB = 384
-CONTEXT_LEN = 32
+N_LAYER = 1
+N_HEAD = 1
+N_EMB = 64
+CONTEXT_LEN = 16
 
 # Data configuration
 VOCAB_SIZE = 1024            # BPE vocabulary size
