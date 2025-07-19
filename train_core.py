@@ -8,7 +8,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.algorithms.ddp_comm_hooks import default as comm_hooks
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Union
 import math
 from functools import partial
 from collections import deque, defaultdict
@@ -138,6 +138,86 @@ def load_pretokenized_data(vocab_size: int = VOCAB_SIZE, split: str = "train") -
     return data
 
 
+class TokenizedDataLoader:
+    """
+    Memory-mapped loader for pre-tokenized binary data.
+    
+    This loader uses numpy memory mapping for efficient data access without
+    loading the entire dataset into memory. It handles distributed training
+    by partitioning data across ranks and provides contextual windows for
+    GRPO training.
+    """
+    def __init__(self, data_path: str, batch_size: int, context_len: int,
+                 horizon: int, rank: int, world_size: int, device: torch.device):
+        # Load data as memory-mapped array
+        self.data = np.memmap(data_path, dtype=np.uint16, mode='r')
+        self.batch_size = batch_size
+        self.context_len = context_len
+        self.horizon = horizon
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        
+        # Calculate starting position for this rank
+        total_len = len(self.data)
+        self.max_start_pos = total_len - context_len - batch_size * horizon - 1
+        
+        if self.max_start_pos <= 0:
+            raise ValueError(
+                f"Dataset too small ({total_len} tokens) for context_len={context_len}, "
+                f"batch_size={batch_size}, horizon={horizon}"
+            )
+        
+        # Distribute starting positions across ranks
+        positions_per_rank = max(1, self.max_start_pos // max(1, world_size))
+        self.pos = context_len + (rank * positions_per_rank) % self.max_start_pos
+        
+        print(f"TokenizedDataLoader initialized for rank {rank}/{world_size}")
+        print(f"Data size: {total_len:,} tokens, starting position: {self.pos}")
+    
+    def next(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get next batch of contexts and targets."""
+        # Wrap around if we reach the end
+        if self.pos + self.batch_size * self.horizon + 1 > len(self.data):
+            self.pos = self.context_len
+        
+        contexts = []
+        targets = []
+        
+        for b in range(self.batch_size):
+            ctx_start = self.pos - self.context_len + b * self.horizon
+            ctx_end = self.pos + b * self.horizon
+            
+            # Load from memory-mapped array and convert to tensor
+            context = self.data[ctx_start:ctx_end].astype(np.int64)
+            target = self.data[ctx_end:ctx_end + self.horizon].astype(np.int64)
+            
+            contexts.append(torch.from_numpy(context))
+            targets.append(torch.from_numpy(target))
+        
+        # Move position forward
+        self.pos += self.batch_size * self.horizon
+        
+        # Stack and move to device
+        contexts = torch.stack(contexts).to(self.device)
+        targets = torch.stack(targets).to(self.device)
+        
+        return contexts, targets
+    
+    def state_dict(self) -> Dict:
+        """Save loader state for checkpointing."""
+        return {
+            'pos': self.pos,
+            'rank': self.rank
+        }
+    
+    def load_state_dict(self, state: Dict):
+        """Restore loader state from checkpoint."""
+        self.pos = state['pos']
+        if state['rank'] != self.rank:
+            print(f"Warning: Loading state from rank {state['rank']} to rank {self.rank}")
+
+
 class DistributedContextualTextLoader:
     """
     GPU-resident data loader for GRPO training
@@ -145,10 +225,18 @@ class DistributedContextualTextLoader:
     - Each GPU gets the full dataset but starts at different positions
     - Provides contextual windows for next-token prediction
     """
-    def __init__(self, text: str, encode_fn, batch_size: int, horizon: int, 
-                 context_len: int, rank: int, world_size: int, device: torch.device):
-        # Load and encode data ONCE to GPU
-        self.data = encode_fn(text).to(device)
+    def __init__(self, data: Union[str, np.ndarray], encode_fn=None, batch_size: int = None, 
+                 horizon: int = None, context_len: int = None, rank: int = 0, 
+                 world_size: int = 1, device: torch.device = None):
+        # Handle both text and pre-tokenized data
+        if isinstance(data, np.ndarray):
+            # Pre-tokenized path: convert to tensor and load to GPU
+            self.data = torch.from_numpy(data.astype(np.int64)).to(device)
+        else:
+            # Legacy text path (for compatibility)
+            if encode_fn is None:
+                raise ValueError("encode_fn must be provided when data is text")
+            self.data = encode_fn(data).to(device)
         self.batch_size = batch_size
         self.horizon = horizon
         self.context_len = context_len
@@ -744,48 +832,9 @@ def get_kl_weight(sample_count: int) -> float:
     return kl_weight
 
 
-def prepare_tinyshakespeare() -> Tuple[str, Dict[str, int], Dict[int, str]]:
-    """Load and prepare the TinyShakespeare dataset"""
-    # Check Modal volume path first, then local
-    data_paths = ["/data/input.txt", "input.txt", "tinyshakespeare.txt"]
-    data_path = None
-    
-    for path in data_paths:
-        if os.path.exists(path):
-            data_path = path
-            break
-    
-    if data_path is None:
-        # Download if not found
-        data_path = "input.txt"
-        import urllib.request
-        url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-        urllib.request.urlretrieve(url, data_path)
-    
-    with open(data_path, 'r', encoding='utf-8') as f:
-        text = f.read()
-    
-    # Use a fixed character set to ensure consistency across processes
-    # This is the standard Shakespeare character set with 65 characters
-    chars = "\n !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-    assert len(chars) == 65, f"Expected 65 chars, got {len(chars)}"
-    
-    char_to_idx = {ch: i for i, ch in enumerate(chars)}
-    idx_to_char = {i: ch for i, ch in enumerate(chars)}
-    
-    # Verify all text characters are in our charset
-    text_chars = set(text)
-    for ch in text_chars:
-        if ch not in char_to_idx:
-            print(f"Warning: Character '{ch}' (ord={ord(ch)}) not in fixed charset, will be ignored")
-    
-    return text, char_to_idx, idx_to_char
-
-
 def compute_rewards(
     sequences: torch.Tensor,
     model: nn.Module,
-    char_to_idx: Dict[str, int],
     device: torch.device,
     curriculum_manager: Optional[CurriculumManager] = None
 ) -> torch.Tensor:
@@ -867,7 +916,6 @@ def train_step(
     scaler: torch.amp.GradScaler,
     input_ids: torch.Tensor,
     sample_count: int,
-    char_to_idx: Dict[str, int],
     device: torch.device,
     accumulation_step: int,
     total_accumulation_steps: int,
@@ -882,7 +930,6 @@ def train_step(
         optimizer: Optimizer
         input_ids: Input token IDs [batch_size, context_len]
         sample_count: Total samples seen so far (for KL scheduling)
-        char_to_idx: Character to index mapping
         device: Device to run on
         accumulation_step: Current gradient accumulation step
         total_accumulation_steps: Total gradient accumulation steps
@@ -932,7 +979,7 @@ def train_step(
     # Compute rewards for all samples
     rewards_list = []
     for k in range(K_SAMPLES):
-        rewards = compute_rewards(all_sequences[k], model, char_to_idx, device, curriculum_manager)
+        rewards = compute_rewards(all_sequences[k], model, device, curriculum_manager)
         rewards_list.append(rewards)
     all_rewards = torch.stack(rewards_list)  # [K, B]
     
@@ -1122,9 +1169,8 @@ def train_step(
 
 def evaluate_model(
     model: nn.Module,
-    text: str,
-    char_to_idx: Dict[str, int],
-    idx_to_char: Dict[int, str],
+    val_data: np.ndarray,
+    tokenizer,
     device: torch.device,
     eval_iters: int = 50
 ) -> Dict[str, float]:
@@ -1135,12 +1181,11 @@ def evaluate_model(
     # Calculate perplexity on random sequences
     with torch.no_grad():
         for _ in range(eval_iters):
-            # Get random slice of data
-            start_idx = torch.randint(0, len(text) - CONTEXT_LEN - 1, (1,)).item()
-            chunk = text[start_idx:start_idx + CONTEXT_LEN + 1]
-            indices = [char_to_idx.get(ch, 0) for ch in chunk]
-            x = torch.tensor(indices[:-1], device=device).unsqueeze(0)
-            y = torch.tensor(indices[1:], device=device).unsqueeze(0)
+            # Get random slice of validation data
+            start_idx = torch.randint(0, len(val_data) - CONTEXT_LEN - 1, (1,)).item()
+            indices = val_data[start_idx:start_idx + CONTEXT_LEN + 1]
+            x = torch.tensor(indices[:-1], device=device, dtype=torch.long).unsqueeze(0)
+            y = torch.tensor(indices[1:], device=device, dtype=torch.long).unsqueeze(0)
             
             _, loss = model(x, y)
             losses.append(loss.mean().item())
@@ -1149,11 +1194,11 @@ def evaluate_model(
     perplexity = math.exp(avg_loss)
     
     # Generate a sample
-    context = "KING HENRY VI:"
-    context_indices = [char_to_idx.get(ch, 0) for ch in context]
-    x = torch.tensor(context_indices, device=device).unsqueeze(0)
+    context = "First Citizen:\nBefore we proceed any further, hear me speak."
+    context_tokens = tokenizer.encode(context).ids
+    x = torch.tensor(context_tokens, device=device, dtype=torch.long).unsqueeze(0)
     
-    model.init_kv_caches(batch_size=1, max_seq_len=len(context) + 100, device=device)
+    model.init_kv_caches(batch_size=1, max_seq_len=len(context_tokens) + 100, device=device)
     
     generated_indices = []
     for _ in range(100):
@@ -1167,7 +1212,8 @@ def evaluate_model(
     model.reset_kv_caches()
     model.disable_kv_caches()
     
-    generated_text = ''.join([idx_to_char[idx] for idx in generated_indices])
+    # Decode the generated tokens
+    generated_text = tokenizer.decode(generated_indices)
     full_text = context + generated_text
     
     return {
@@ -1215,6 +1261,81 @@ def save_checkpoint(
     print(f"Saved checkpoint to {checkpoint_path}")
 
 
+def load_checkpoint(
+    checkpoint_path: str,
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
+    curriculum_manager: Optional[CurriculumManager] = None,
+    strict: bool = True
+) -> Dict:
+    """Load model checkpoint and validate configuration.
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+        model: Model to load state into
+        optimizer: Optional optimizer to load state into
+        scaler: Optional gradient scaler to load state into
+        curriculum_manager: Optional curriculum manager to load state into
+        strict: Whether to strictly enforce matching keys in state_dict
+    
+    Returns:
+        Dictionary containing checkpoint metadata
+    """
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
+    print(f"Loading checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    # Validate configuration
+    if 'config' in checkpoint:
+        config = checkpoint['config']
+        
+        # Check vocab_size compatibility
+        if 'vocab_size' in config:
+            checkpoint_vocab_size = config['vocab_size']
+            model_vocab_size = model.vocab_size if hasattr(model, 'vocab_size') else VOCAB_SIZE
+            
+            if checkpoint_vocab_size != model_vocab_size:
+                raise ValueError(
+                    f"Vocab size mismatch: checkpoint has vocab_size={checkpoint_vocab_size}, "
+                    f"but model expects vocab_size={model_vocab_size}. "
+                    f"Please ensure you're using the correct tokenizer and model configuration."
+                )
+        
+        # Validate other critical parameters
+        if config.get('n_layer') != N_LAYER:
+            print(f"Warning: Layer count mismatch - checkpoint: {config.get('n_layer')}, config: {N_LAYER}")
+        if config.get('n_head') != N_HEAD:
+            print(f"Warning: Head count mismatch - checkpoint: {config.get('n_head')}, config: {N_HEAD}")
+        if config.get('n_emb') != N_EMB:
+            print(f"Warning: Embedding size mismatch - checkpoint: {config.get('n_emb')}, config: {N_EMB}")
+    
+    # Load model state
+    model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+    
+    # Load optimizer state if provided
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    # Load scaler state if provided
+    if scaler is not None and 'scaler_state_dict' in checkpoint:
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    
+    # Load curriculum state if provided
+    if curriculum_manager is not None and 'curriculum_state' in checkpoint:
+        curriculum_manager.load_state_dict(checkpoint['curriculum_state'])
+    
+    print(f"Successfully loaded checkpoint from iteration {checkpoint.get('iteration', 'unknown')}")
+    
+    return {
+        'iteration': checkpoint.get('iteration', 0),
+        'metrics': checkpoint.get('metrics', {}),
+        'config': checkpoint.get('config', {})
+    }
+
+
 def main(rank: int = 0, world_size: int = 1):
     """Main training function"""
     # Set seeds for reproducibility
@@ -1233,19 +1354,17 @@ def main(rank: int = 0, world_size: int = 1):
     torch.backends.cudnn.benchmark = True
     torch.cuda.set_per_process_memory_fraction(0.95)
     
-    # Load dataset
-    text, char_to_idx, idx_to_char = prepare_tinyshakespeare()
+    # Load pre-tokenized data
+    train_data = load_pretokenized_data(VOCAB_SIZE, "train")
+    val_data = load_pretokenized_data(VOCAB_SIZE, "val")
     
-    # Use fixed vocab size like the bible
-    vocab_size = 65  # Hardcoded like in train_original.py
+    # Load BPE tokenizer for decoding
+    tokenizer = load_bpe_tokenizer(VOCAB_SIZE)
     
-    # Create encode function for the data loader that handles missing characters
-    encode = lambda s: torch.tensor([char_to_idx.get(ch, 0) for ch in s], dtype=torch.long)
-    
-    # Initialize GPU-resident data loader
+    # Initialize GPU-resident data loader with pre-tokenized data
     loader = DistributedContextualTextLoader(
-        text=text,
-        encode_fn=encode,
+        data=train_data,  # Pass pre-tokenized numpy array directly
+        encode_fn=None,   # Not needed for pre-tokenized data
         batch_size=MICRO_BATCH,
         horizon=HORIZON,
         context_len=CONTEXT_LEN,
@@ -1254,9 +1373,9 @@ def main(rank: int = 0, world_size: int = 1):
         device=device
     )
     
-    # Initialize models with actual vocab size
-    model = GPT(vocab_size=vocab_size).to(device)
-    ref_model = GPT(vocab_size=vocab_size).to(device)
+    # Initialize models with BPE vocab size
+    model = GPT(vocab_size=VOCAB_SIZE).to(device)
+    ref_model = GPT(vocab_size=VOCAB_SIZE).to(device)
     ref_model.load_state_dict(model.state_dict())
     ref_model.eval()
     for param in ref_model.parameters():
@@ -1273,10 +1392,10 @@ def main(rank: int = 0, world_size: int = 1):
     # Setup gradient scaler for mixed precision
     scaler = torch.amp.GradScaler('cuda', enabled=True)
     
-    # Initialize curriculum manager
+    # Initialize curriculum manager with BPE vocab size
     curriculum_manager = CurriculumManager(
         device=device,
-        vocab_size=vocab_size,
+        vocab_size=VOCAB_SIZE,
         total_iterations=TOTAL_ITERS,
         promotion_threshold=0.05,
         ema_alpha=0.95
@@ -1296,7 +1415,7 @@ def main(rank: int = 0, world_size: int = 1):
             name="perplexity_fix_2",
             config={
                 "model": {
-                    "vocab_size": vocab_size,  # Use actual vocab size
+                    "vocab_size": VOCAB_SIZE,  # Use actual vocab size
                     "n_layer": N_LAYER,
                     "n_head": N_HEAD,
                     "n_emb": N_EMB,
@@ -1358,7 +1477,6 @@ def main(rank: int = 0, world_size: int = 1):
                 scaler,
                 contexts,  # Already on GPU
                 sample_count,
-                char_to_idx,
                 device,
                 accum_step,
                 GRAD_ACCUM,
@@ -1420,7 +1538,7 @@ def main(rank: int = 0, world_size: int = 1):
         if rank == 0 and it % 100 == 0:
             eval_metrics = evaluate_model(
                 model.module if world_size > 1 else model,
-                text, char_to_idx, idx_to_char, device
+                val_data, tokenizer, device
             )
             print(f"\n[Eval] Perplexity: {eval_metrics['perplexity']:.2f}")
             print(f"Sample: {eval_metrics['sample'][:200]}...\n")
