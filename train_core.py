@@ -298,7 +298,7 @@ class CurriculumManager:
     Manages curriculum learning with staged training based on perplexity tracking.
     Progressively increases task complexity through 5 stages.
     """
-    def __init__(self, device: torch.device, vocab_size: int = 65,
+    def __init__(self, device: torch.device, vocab_size: int = VOCAB_SIZE,
                  ema_alpha: float = 0.95,
                  promotion_threshold: float = 0.05,
                  promotion_patience: int = 100,
@@ -362,7 +362,7 @@ class CurriculumManager:
         return {
             0: {
                 'name': 'Bigram Foundation',
-                'description': 'Learn character transitions',
+                'description': 'Learn token transitions',
                 'word_weights': [0.0, 0.0, 0.0, 0.0, 0.0],
                 'ngram_weight': 1.0,
                 'perplexity_threshold': 0.2,
@@ -863,11 +863,11 @@ def compute_rewards(
         # Normalize perplexity reward to reasonable range
         perplexity_reward = torch.clamp(perplexity_reward, 0.0, 1.0)
     
-    # Character diversity penalty
+    # Token diversity penalty
     for i in range(B):
         seq = sequences[i].tolist()
-        unique_chars = len(set(seq))
-        diversity_score = unique_chars / len(seq)
+        unique_tokens = len(set(seq))
+        diversity_score = unique_tokens / len(seq)
         rewards[i] += diversity_score * 0.3  # Weight diversity component
     
     # Repetition penalty for consecutive duplicates
@@ -1452,7 +1452,7 @@ def main(rank: int = 0, world_size: int = 1):
         print(f"Total iterations: {TOTAL_ITERS}", flush=True)
         print(f"Gradient accumulation steps: {GRAD_ACCUM}", flush=True)
     
-    chars_seen = 0
+    tokens_seen = 0
     
     # Use tqdm for progress tracking on rank 0
     for it in tqdm(range(1, TOTAL_ITERS + 1), desc="Training", disable=(rank != 0)):
@@ -1484,7 +1484,7 @@ def main(rank: int = 0, world_size: int = 1):
             )
             
             sample_count += contexts.shape[0] * world_size
-            chars_seen += contexts.shape[0] * CONTEXT_LEN * world_size
+            tokens_seen += contexts.shape[0] * CONTEXT_LEN * world_size
             recent_losses.append(metrics['loss'])
         
         # Update curriculum metrics after each iteration
@@ -1496,7 +1496,7 @@ def main(rank: int = 0, world_size: int = 1):
             current_stage = curriculum_manager.current_stage if curriculum_manager else 0
             print(f"Iter {it}: loss={metrics['loss']:.4f}, acc={metrics.get('accuracy', 0):.3f}, "
                   f"kl={metrics.get('kl_loss', 0):.4f}, gpt2_kl={metrics.get('gpt2_kl', 0):.4f}, "
-                  f"stage={current_stage}, chars={chars_seen:,}", flush=True)
+                  f"stage={current_stage}, tokens={tokens_seen:,}", flush=True)
         
         # WandB logging
         if rank == 0 and it % 2 == 0:
@@ -1514,7 +1514,7 @@ def main(rank: int = 0, world_size: int = 1):
                 "training/lr": lr,
                 "training/kl_weight": metrics['kl_weight'],
                 "training/num_selected": metrics['num_selected'],
-                "training/chars_seen": chars_seen,
+                "training/tokens_seen": tokens_seen,
             }
             
             # Add curriculum metrics

@@ -2,7 +2,7 @@ import modal
 from pathlib import Path
 from config import N_GPUS, GPU_TYPE
 
-app = modal.App("perplexity_fix_2")
+app = modal.App("avatarRL-bpe-v1")
 
 flash_attn_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 

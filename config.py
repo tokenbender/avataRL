@@ -1,4 +1,5 @@
 """Configuration constants for avataRL training."""
+import os
 
 # Hardware
 N_GPUS = 8
@@ -12,7 +13,7 @@ CONTEXT_LEN = 16
 
 # Data configuration
 VOCAB_SIZE = 1024            # BPE vocabulary size
-DATA_ROOT = "./data"         # Root directory for data files
+DATA_ROOT = "/data" if os.path.exists("/data") else "./data"  # Use Modal mount if available
 MODAL_VOLUME = "nanogpt-data" # Modal volume name for cloud deployments
 
 # Tokenizer paths (relative to DATA_ROOT or MODAL_VOLUME)
