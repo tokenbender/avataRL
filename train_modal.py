@@ -54,7 +54,8 @@ if __name__ == "__main__":
         torch.cuda.set_device(local_rank)
     
     print(f"Starting training on rank {rank} of {world_size}")
-    main(rank, world_size)
+    # Pass Modal volume mount path to main
+    main(rank, world_size, data_root="/data")
 """
     
     with open("/tmp/train_wrapper.py", "w") as f:

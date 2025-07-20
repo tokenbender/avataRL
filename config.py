@@ -13,8 +13,8 @@ CONTEXT_LEN = 16
 
 # Data configuration
 VOCAB_SIZE = 1024            # BPE vocabulary size
-DATA_ROOT = "/data" if os.path.exists("/data") else "./data"  # Use Modal mount if available
-MODAL_VOLUME = "nanogpt-data" # Modal volume name for cloud deployments
+DATA_ROOT = "./data"         # Base data directory - wrappers handle deployment-specific paths
+# MODAL_VOLUME removed - handled by train_modal.py wrapper
 
 # Tokenizer paths (relative to DATA_ROOT or MODAL_VOLUME)
 TOKENIZER_DIR = "tokenizers"

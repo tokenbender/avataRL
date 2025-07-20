@@ -22,24 +22,20 @@ import numpy as np
 _tokenizer = None
 
 
-def check_tokenizer_exists(vocab_size: int = VOCAB_SIZE) -> bool:
+def check_tokenizer_exists(vocab_size: int = VOCAB_SIZE, data_root: str = None) -> bool:
     """Check if the BPE tokenizer exists and provide instructions if not."""
-    # Check Modal volume path first, then local paths
-    tokenizer_paths = [
-        f"/data/{TOKENIZER_DIR}/shakespeare-bpe-{vocab_size}.json",
-        os.path.join(DATA_ROOT, TOKENIZER_DIR, f"shakespeare-bpe-{vocab_size}.json")
-    ]
+    if data_root is None:
+        data_root = DATA_ROOT
     
-    for path in tokenizer_paths:
-        if os.path.exists(path):
-            return True
+    tokenizer_path = os.path.join(data_root, TOKENIZER_DIR, f"shakespeare-bpe-{vocab_size}.json")
+    
+    if os.path.exists(tokenizer_path):
+        return True
     
     print(f"\n{'='*60}")
     print(f"ERROR: BPE tokenizer not found!")
     print(f"{'='*60}")
-    print(f"Expected tokenizer at one of:")
-    for path in tokenizer_paths:
-        print(f"  - {path}")
+    print(f"Expected tokenizer at: {tokenizer_path}")
     print(f"\nTo create the tokenizer:")
     print(f"  1. Install tokenizers: pip install tokenizers")
     print(f"  2. Run: python create_tokenizer_example.py --vocab-size {vocab_size}")
@@ -49,12 +45,15 @@ def check_tokenizer_exists(vocab_size: int = VOCAB_SIZE) -> bool:
     return False
 
 
-def load_bpe_tokenizer(vocab_size: int = VOCAB_SIZE):
-    """Load BPE tokenizer from Modal volume or local path."""
+def load_bpe_tokenizer(vocab_size: int = VOCAB_SIZE, data_root: str = None):
+    """Load BPE tokenizer from specified data root."""
     global _tokenizer
     
     if _tokenizer is not None:
         return _tokenizer
+    
+    if data_root is None:
+        data_root = DATA_ROOT
     
     try:
         from tokenizers import Tokenizer
@@ -64,20 +63,10 @@ def load_bpe_tokenizer(vocab_size: int = VOCAB_SIZE):
             "Install with: pip install tokenizers"
         )
     
-    # Check Modal volume path first, then local paths
-    tokenizer_paths = [
-        f"/data/{TOKENIZER_DIR}/shakespeare-bpe-{vocab_size}.json",
-        os.path.join(DATA_ROOT, TOKENIZER_DIR, f"shakespeare-bpe-{vocab_size}.json")
-    ]
+    tokenizer_path = os.path.join(data_root, TOKENIZER_DIR, f"shakespeare-bpe-{vocab_size}.json")
     
-    tokenizer_path = None
-    for path in tokenizer_paths:
-        if os.path.exists(path):
-            tokenizer_path = path
-            break
-    
-    if tokenizer_path is None:
-        if not check_tokenizer_exists(vocab_size):
+    if not os.path.exists(tokenizer_path):
+        if not check_tokenizer_exists(vocab_size, data_root):
             raise FileNotFoundError(
                 f"BPE tokenizer not found for vocab_size={vocab_size}"
             )
@@ -89,38 +78,30 @@ def load_bpe_tokenizer(vocab_size: int = VOCAB_SIZE):
     return _tokenizer
 
 
-def load_pretokenized_data(vocab_size: int = VOCAB_SIZE, split: str = "train") -> np.ndarray:
-    """Load pre-tokenized binary data from Modal volume or local path.
+def load_pretokenized_data(vocab_size: int = VOCAB_SIZE, split: str = "train", data_root: str = None) -> np.ndarray:
+    """Load pre-tokenized binary data from specified data root.
     
     Args:
         vocab_size: BPE vocabulary size
         split: 'train' or 'val'
+        data_root: Root directory for data (uses DATA_ROOT if not specified)
     
     Returns:
         Memory-mapped numpy array of token IDs (uint16 format)
     """
+    if data_root is None:
+        data_root = DATA_ROOT
+    
     # Format the tokenized data directory name
     data_dir_name = TOKENIZED_DATA_DIR.format(vocab_size=vocab_size)
     
-    # Check Modal volume path first, then local paths
-    data_paths = [
-        f"/data/{data_dir_name}/{split}.bin",
-        os.path.join(DATA_ROOT, data_dir_name, f"{split}.bin")
-    ]
+    data_path = os.path.join(data_root, data_dir_name, f"{split}.bin")
     
-    data_path = None
-    for path in data_paths:
-        if os.path.exists(path):
-            data_path = path
-            break
-    
-    if data_path is None:
+    if not os.path.exists(data_path):
         print(f"\n{'='*60}")
         print(f"ERROR: Pre-tokenized data not found!")
         print(f"{'='*60}")
-        print(f"Expected {split}.bin at one of:")
-        for path in data_paths:
-            print(f"  - {path}")
+        print(f"Expected {split}.bin at: {data_path}")
         print(f"\nTo create tokenized data:")
         print(f"  1. Ensure you have the BPE tokenizer (vocab_size={vocab_size})")
         print(f"  2. Run tokenization script or use Modal:")
@@ -1336,7 +1317,7 @@ def load_checkpoint(
     }
 
 
-def main(rank: int = 0, world_size: int = 1):
+def main(rank: int = 0, world_size: int = 1, data_root: str = None):
     """Main training function"""
     # Set seeds for reproducibility
     torch.manual_seed(42)
@@ -1355,11 +1336,11 @@ def main(rank: int = 0, world_size: int = 1):
     torch.cuda.set_per_process_memory_fraction(0.95)
     
     # Load pre-tokenized data
-    train_data = load_pretokenized_data(VOCAB_SIZE, "train")
-    val_data = load_pretokenized_data(VOCAB_SIZE, "val")
+    train_data = load_pretokenized_data(VOCAB_SIZE, "train", data_root)
+    val_data = load_pretokenized_data(VOCAB_SIZE, "val", data_root)
     
     # Load BPE tokenizer for decoding
-    tokenizer = load_bpe_tokenizer(VOCAB_SIZE)
+    tokenizer = load_bpe_tokenizer(VOCAB_SIZE, data_root)
     
     # Initialize GPU-resident data loader with pre-tokenized data
     loader = DistributedContextualTextLoader(
@@ -1574,6 +1555,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world-size", type=int, default=1)
+    parser.add_argument("--data-root", type=str, default=None, help="Root directory for data")
     args = parser.parse_args()
     
-    main(args.rank, args.world_size)
+    main(args.rank, args.world_size, args.data_root)
