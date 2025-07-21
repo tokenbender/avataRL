@@ -15,8 +15,8 @@ image = (
     .add_local_file("config.py", "/root/config.py")
 )
 
-volume = modal.Volume.from_name("grpo-data", create_if_missing=True)
-shakespeare_volume = modal.Volume.from_name("nanogpt-data", create_if_missing=False)
+volume = modal.Volume.from_name("avataRL-out", create_if_missing=True)
+shakespeare_volume = modal.Volume.from_name("avataRL-in", create_if_missing=False)
 
 
 @app.function(
