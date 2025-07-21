@@ -1317,7 +1317,7 @@ def load_checkpoint(
     }
 
 
-def main(rank: int = 0, world_size: int = 1, data_root: str = None):
+def main(rank: int = 0, world_size: int = 1, data_root: str = None, output_root: str = None):
     """Main training function"""
     # Set seeds for reproducibility
     torch.manual_seed(42)
@@ -1381,6 +1381,9 @@ def main(rank: int = 0, world_size: int = 1, data_root: str = None):
         promotion_threshold=0.05,
         ema_alpha=0.95
     )
+    
+    # Set checkpoint directory based on output_root
+    checkpoint_dir = "checkpoints" if output_root is None else os.path.join(output_root, "checkpoints")
     
     # Training loop
     model.train()
@@ -1528,16 +1531,17 @@ def main(rank: int = 0, world_size: int = 1, data_root: str = None):
         if rank == 0 and SAVE_INTERMEDIATE_CHECKPOINTS and it % CHECKPOINT_INTERVAL == 0:
             save_checkpoint(
                 model.module if world_size > 1 else model,
-                optimizer, it, metrics,
+                optimizer, it, metrics, checkpoint_dir,
                 scaler=scaler,
                 curriculum_manager=curriculum_manager
             )
     
     # Final checkpoint
     if rank == 0 and SAVE_FINAL_CHECKPOINT:
+        final_checkpoint_dir = os.path.join(checkpoint_dir, "final")
         save_checkpoint(
             model.module if world_size > 1 else model,
-            optimizer, it, metrics, "checkpoints/final",
+            optimizer, it, metrics, final_checkpoint_dir,
             scaler=scaler,
             curriculum_manager=curriculum_manager
         )
@@ -1556,6 +1560,7 @@ if __name__ == "__main__":
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world-size", type=int, default=1)
     parser.add_argument("--data-root", type=str, default=None, help="Root directory for data")
+    parser.add_argument("--output-root", type=str, default=None, help="Root directory for outputs (checkpoints, logs)")
     args = parser.parse_args()
     
-    main(args.rank, args.world_size, args.data_root)
+    main(args.rank, args.world_size, args.data_root, args.output_root)
