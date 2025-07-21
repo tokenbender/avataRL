@@ -1,21 +1,30 @@
 """Configuration constants for avataRL training."""
+import os
 
 # Hardware
 N_GPUS = 8
 GPU_TYPE = "H100"
 
 # Model architecture
-N_LAYER = 6  # Increased from 1 to match original
-N_HEAD = 6   # Increased from 1 to match original
-N_EMB = 384  # Increased from 16 to match original
-CONTEXT_LEN = 32  # Increased from 8 to match original
-VOCAB_SIZE = 65  # Character-level tokenization
+N_LAYER = 1
+N_HEAD = 1
+N_EMB = 64
+CONTEXT_LEN = 16
+
+# Data configuration
+VOCAB_SIZE = 1024            # BPE vocabulary size
+DATA_ROOT = "./data"         # Base data directory - wrappers handle deployment-specific paths
+# MODAL_VOLUME removed - handled by train_modal.py wrapper
+
+# Tokenizer paths (relative to DATA_ROOT or MODAL_VOLUME)
+TOKENIZER_DIR = "tokenizers"
+TOKENIZED_DATA_DIR = "shakespeare_tokens_bpe{vocab_size}"  # Will be formatted with vocab_size
 
 # Training
 BATCH = 16384
 MICRO_BATCH = 256  # Reduced to match original for larger model
 GRAD_ACCUM = BATCH // (MICRO_BATCH * N_GPUS)
-EPOCHS = 1.0
+EPOCHS = 0.2
 DATASET_SIZE = 1_115_394
 ITERS_PER_EPOCH = DATASET_SIZE // BATCH
 TOTAL_ITERS = int(ITERS_PER_EPOCH * EPOCHS)
