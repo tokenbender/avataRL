@@ -100,41 +100,6 @@ wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakesp
 ```
 
 ### modal deployment
-
-#### data preparation
-Before running Modal training, you need to prepare and upload the tokenized data:
-
-```bash
-# Install required dependencies
-pip install modal tokenizers
-
-# Prepare data locally (optional, for testing)
-python prepare_modal_data.py --local
-
-# Upload data to Modal volume
-python prepare_modal_data.py --upload
-```
-
-This will:
-1. Download the Shakespeare text dataset
-2. Tokenize it using the BPE tokenizer (vocab size 1024)
-3. Create train/val splits (90/10)
-4. Upload to the Modal `nanogpt-data` volume
-
-#### volume management
-```bash
-# List contents of Modal volumes
-python modal_volume_ls.py           # List both volumes
-python modal_volume_ls.py --input   # List input data only
-python modal_volume_ls.py --output  # List outputs/checkpoints only
-
-# Clean up old artifacts
-python modal_volume_clean.py --dry-run              # Preview cleanup
-python modal_volume_clean.py --keep-checkpoints 5   # Keep 5 most recent
-python modal_volume_clean.py --clear-logs-days 7    # Clear old logs
-```
-
-#### training
 ```bash
 pip install modal
 modal run train_modal.py
