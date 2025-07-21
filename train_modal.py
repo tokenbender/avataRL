@@ -23,6 +23,7 @@ shakespeare_volume = modal.Volume.from_name("nanogpt-data", create_if_missing=Fa
     gpu=f"{GPU_TYPE}:{N_GPUS}",
     volumes={
         "/data": shakespeare_volume,
+        "/outputs": volume,  # Mount persistent output storage
     },
     timeout=60 * 60 * 6,
     image=image,
@@ -54,8 +55,8 @@ if __name__ == "__main__":
         torch.cuda.set_device(local_rank)
     
     print(f"Starting training on rank {rank} of {world_size}")
-    # Pass Modal volume mount path to main
-    main(rank, world_size, data_root="/data")
+    # Pass Modal volume mount paths to main
+    main(rank, world_size, data_root="/data", output_root="/outputs")
 """
     
     with open("/tmp/train_wrapper.py", "w") as f:
