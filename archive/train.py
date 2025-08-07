@@ -12,6 +12,7 @@ Usage:
 
 import os
 import torch
+from config import DATA_ROOT
 from train_core import main
 
 
@@ -26,4 +27,5 @@ if __name__ == "__main__":
         torch.cuda.set_device(local_rank)
     
     print(f"Starting training on rank {rank} of {world_size}")
-    main(rank, world_size)
+    # Use local data path from config
+    main(rank, world_size, data_root=DATA_ROOT)

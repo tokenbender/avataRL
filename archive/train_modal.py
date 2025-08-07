@@ -2,31 +2,32 @@ import modal
 from pathlib import Path
 from config import N_GPUS, GPU_TYPE
 
-app = modal.App("perplexity_fix_2")
+app = modal.App("avatarRL-bpe-v1")
 
 flash_attn_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("packaging", "wheel", "setuptools")
-    .pip_install("numpy", "torch==2.5.0", "tqdm", "wandb", "requests", "matplotlib", "nvidia-ml-py3")
+    .pip_install("numpy", "torch==2.5.0", "tqdm", "wandb", "requests", "matplotlib", "nvidia-ml-py3", "tokenizers")
     .pip_install(flash_attn_wheel)
     .add_local_file("train_core.py", "/root/train_core.py")
     .add_local_file("config.py", "/root/config.py")
 )
 
-volume = modal.Volume.from_name("grpo-data", create_if_missing=True)
-shakespeare_volume = modal.Volume.from_name("nanogpt-data", create_if_missing=False)
+volume = modal.Volume.from_name("avataRL-out", create_if_missing=True)
+shakespeare_volume = modal.Volume.from_name("avataRL-in", create_if_missing=False)
 
 
 @app.function(
     gpu=f"{GPU_TYPE}:{N_GPUS}",
     volumes={
         "/data": shakespeare_volume,
+        "/outputs": volume,  # Mount persistent output storage
     },
     timeout=60 * 60 * 6,
     image=image,
-    secrets=[modal.Secret.from_name("wandb-secret")],
+    secrets=[modal.Secret.from_name("wandb")],
 )
 def train_distributed():
     """Launch distributed training with torchrun"""
@@ -54,7 +55,8 @@ if __name__ == "__main__":
         torch.cuda.set_device(local_rank)
     
     print(f"Starting training on rank {rank} of {world_size}")
-    main(rank, world_size)
+    # Pass Modal volume mount paths to main
+    main(rank, world_size, data_root="/data", output_root="/outputs")
 """
     
     with open("/tmp/train_wrapper.py", "w") as f:
