@@ -114,6 +114,9 @@ def train_single_node():
 def _train_avatarl_single_node():
     from torch.distributed.run import parse_args, run
 
+    # Create the directory if it doesn't exist
+    os.makedirs("/root/data/openwebtext", exist_ok=True)
+    
     # Symlink the training data in our volume to the place that nanoGPT expects it.
     os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
     os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
