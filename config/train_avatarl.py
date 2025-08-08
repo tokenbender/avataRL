@@ -69,7 +69,7 @@ bench = False  # Whether we're benchmarking - calculates MFU on each iteration
 # -----------------------------------------------------------------------------
 # AvataRL specific parameters
 # -----------------------------------------------------------------------------
-teacher_model_path = 'out/ckpt_teacher_25M.pt' # Path to the pre-trained teacher model
+critic_model_path = 'out/ckpt_critic_30M.pt' # Path to the pre-trained critic model
 
 # PoE weights
 reality_weight = 0.7

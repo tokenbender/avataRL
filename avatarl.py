@@ -50,100 +50,17 @@ config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
 
-def get_teacher_topk_logits(teacher_logits: Tensor, k: int = 10) -> tuple[Tensor, Tensor]:
+def load_critic_model(checkpoint_path: str):
     """
-    Returns the top-k logits and their indices from the teacher model.
-    This is a helper function to abstract the top-k selection logic.
-    """
-    return teacher_logits.topk(k, dim=-1)
-
-
-def ndcg_at_k_hybrid(student_logits: Tensor, teacher_logits: Tensor, targets: Tensor, k: int = 10) -> Tensor:
-    """
-    Computes a hybrid, vectorized Normalized Discounted Cumulative Gain (nDCG) at k.
-
-    This metric evaluates the student's ability to rank the ground-truth answer
-    highly, while also aligning with the teacher's most plausible alternatives.
-
-    The relevance scores are defined as:
-    - 1.0 for the ground-truth token.
-    - The teacher's probability for its top-k predictions.
-    If the ground truth is in the teacher's top-k, it retains the 1.0 score.
-
-    Args:
-        student_logits (Tensor): Student model's output logits. Shape: (batch_size, seq_len, vocab_size)
-        teacher_logits (Tensor): Teacher model's output logits. Shape: (batch_size, seq_len, vocab_size)
-        targets (Tensor): Ground-truth target tokens. Shape: (batch_size, seq_len)
-        k (int): The number of top predictions to consider.
-
-    Returns:
-        Tensor: The average nDCG score for the batch.
-    """
-    # Reshape tensors to be (batch*seq_len, vocab_size)
-    vocab_size = student_logits.size(-1)
-    student_logits = student_logits.view(-1, vocab_size)
-    teacher_logits = teacher_logits.view(-1, vocab_size)
-    targets = targets.view(-1)
-
-    # --- 1. Construct Relevance Scores ---
-    teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
-    teacher_top_k_probs, teacher_top_k_indices = teacher_probs.topk(k, dim=-1)
-
-    # Initialize relevance scores tensor
-    relevance = torch.zeros_like(student_logits)
-
-    # Assign relevance from teacher's top-k predictions
-    relevance.scatter_(dim=1, index=teacher_top_k_indices, src=teacher_top_k_probs)
-
-    # Assign highest relevance (1.0) to the ground-truth token
-    relevance.scatter_(dim=1, index=targets.unsqueeze(1), value=1.0)
-
-    # --- 2. Calculate Student's DCG ---
-    # Get student's ranking (indices sorted by logit value)
-    student_ranking = student_logits.argsort(dim=-1, descending=True)
-    
-    # Get relevance of items in the order the student ranked them
-    student_gains = relevance.gather(dim=1, index=student_ranking)
-
-    # --- 3. Calculate Ideal DCG (IDCG) ---
-    # Ideal ranking is the relevance scores sorted in descending order
-    ideal_gains, _ = relevance.sort(dim=-1, descending=True)
-
-    # --- 4. Compute DCG and nDCG ---
-    # Create discounts for each rank position
-    discounts = 1 / torch.log2(torch.arange(vocab_size, device=student_logits.device).float() + 2)
-    
-    # Compute DCG for both student and ideal rankings
-    dcg = (student_gains * discounts).sum(dim=-1)
-    idcg = (ideal_gains * discounts).sum(dim=-1)
-
-    # Handle cases where IDCG is zero to avoid division by zero
-    idcg[idcg == 0] = 1.0
-    
-    ndcg = dcg / idcg
-    
-    return ndcg.mean()
-
-
-
-
-
-
-
-
-
-
-def load_teacher_model(checkpoint_path: str):
-    """
-    Load a pre-trained teacher model from checkpoint.
+    Load a pre-trained critic model from checkpoint.
     
     Args:
-        checkpoint_path: Path to the teacher model checkpoint
+        checkpoint_path: Path to the critic model checkpoint
         
     Returns:
-        teacher_model: Loaded teacher model in eval mode on CUDA
+        critic_model: Loaded critic model in eval mode on CUDA
     """
-    print(f"Loading teacher model from {checkpoint_path}")
+    print(f"Loading critic model from {checkpoint_path}")
     
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location='cuda')
@@ -151,7 +68,7 @@ def load_teacher_model(checkpoint_path: str):
     
     # Create model with checkpoint config
     gptconf = GPTConfig(**checkpoint_model_args)
-    teacher_model = GPT(gptconf)
+    critic_model = GPT(gptconf)
     
     # Load state dict
     state_dict = checkpoint["model"]
@@ -161,22 +78,22 @@ def load_teacher_model(checkpoint_path: str):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     
-    teacher_model.load_state_dict(state_dict)
-    teacher_model.cuda()
-    teacher_model.eval()  # Set to eval mode
+    critic_model.load_state_dict(state_dict)
+    critic_model.cuda()
+    critic_model.eval()  # Set to eval mode
     
-    # Disable gradients for teacher
-    for param in teacher_model.parameters():
+    # Disable gradients for critic
+    for param in critic_model.parameters():
         param.requires_grad = False
     
     print(f"Teacher model loaded successfully - {checkpoint_model_args['n_layer']} layers, {checkpoint_model_args['n_embd']} dim")
     
-    return teacher_model
+    return critic_model
 
 
 def compute_avatarl_loss(
     student_logits: Tensor, 
-    teacher_logits: Tensor, 
+    critic_logits: Tensor, 
     ground_truth_tokens: Tensor,
     reality_weight: float = 0.7,
     mentor_weight: float = 0.3,
@@ -191,7 +108,7 @@ def compute_avatarl_loss(
     This implements a Product of Experts (PoE) reward model that combines:
     1. Reality Expert: Active token label-smoothed distribution
        - 90% probability to ground truth token
-       - 10% spread ONLY across active tokens (student top-k + teacher top-k)
+       - 10% spread ONLY across active tokens (student top-k + critic top-k)
        - Unlike standard label smoothing that spreads across all vocab_size tokens,
          this concentrates the smoothing mass on the ~33 tokens that actually matter
     2. Mentor Expert: Teacher model's distribution over plausible tokens
@@ -202,13 +119,13 @@ def compute_avatarl_loss(
     
     Args:
         student_logits: Student model's output logits. Shape: (batch_size, seq_len, vocab_size)
-        teacher_logits: Teacher model's output logits. Shape: (batch_size, seq_len, vocab_size)
+        critic_logits: Teacher model's output logits. Shape: (batch_size, seq_len, vocab_size)
         ground_truth_tokens: Ground-truth target tokens. Shape: (batch_size, seq_len)
         reality_weight: Weight for reality expert in PoE (default: 0.7)
         mentor_weight: Weight for mentor expert in PoE (default: 0.3)
         label_smoothing_epsilon: Label smoothing parameter distributed over active tokens only (default: 0.1)
         reward_scale: Scale factor for rewards (default: 100.0)
-        top_k: Number of top tokens to consider from both student and teacher (default: 16)
+        top_k: Number of top tokens to consider from both student and critic (default: 16)
         entropy_coefficient: Coefficient for entropy regularization (default: 0.01)
         
     Returns:
@@ -217,28 +134,28 @@ def compute_avatarl_loss(
     batch_size, seq_len, vocab_size = student_logits.shape
     
     # Validate input shapes
-    assert student_logits.shape == teacher_logits.shape, \
-        f"Student and teacher logits shape mismatch: {student_logits.shape} vs {teacher_logits.shape}"
+    assert student_logits.shape == critic_logits.shape, \
+        f"Student and critic logits shape mismatch: {student_logits.shape} vs {critic_logits.shape}"
     assert ground_truth_tokens.shape == (batch_size, seq_len), \
         f"Ground truth shape mismatch: expected {(batch_size, seq_len)}, got {ground_truth_tokens.shape}"
     
     # Reshape to (batch_size * seq_len, vocab_size) for easier processing
     student_logits_flat = student_logits.view(-1, vocab_size)
-    teacher_logits_flat = teacher_logits.view(-1, vocab_size)
+    critic_logits_flat = critic_logits.view(-1, vocab_size)
     ground_truth_flat = ground_truth_tokens.view(-1)
     
     # --- Step 1: Define Expanded Action Space (Student + Teacher + Ground Truth) ---
     # Get student's top-k predictions
     _, student_top_k_indices = student_logits_flat.topk(top_k, dim=-1)
     
-    # Get teacher's top-k predictions
-    _, teacher_top_k_indices = teacher_logits_flat.topk(top_k, dim=-1)
+    # Get critic's top-k predictions
+    _, critic_top_k_indices = critic_logits_flat.topk(top_k, dim=-1)
     
-    # Combine student, teacher, and ground truth indices
+    # Combine student, critic, and ground truth indices
     # Shape: (batch_size * seq_len, top_k * 2 + 1)
     combined_indices = torch.cat([
         student_top_k_indices,
-        teacher_top_k_indices,
+        critic_top_k_indices,
         ground_truth_flat.unsqueeze(1)
     ], dim=1)
     
@@ -264,8 +181,8 @@ def compute_avatarl_loss(
         action_space_indices.append(masked.tolist())
     
     # --- Step 2: Construct the Ideal Reward Distribution (PoE Model) ---
-    # Get mentor (teacher) probabilities
-    mentor_probs = torch.nn.functional.softmax(teacher_logits_flat, dim=-1)
+    # Get mentor (critic) probabilities
+    mentor_probs = torch.nn.functional.softmax(critic_logits_flat, dim=-1)
     
     # VECTORIZED: Create reality expert distribution with ACTIVE TOKEN label smoothing
     # Instead of spreading epsilon across all vocab_size tokens, concentrate it on active tokens only
@@ -400,61 +317,6 @@ def compute_avatarl_loss(
         'avg_action_space_size': avg_action_space_size,
         'avg_entropy': student_entropy.mean().item()
     }
-
-
-def compute_ndcg_hybrid(student_logits, teacher_logits, ground_truth_indices, k=10):
-    """
-    Compute hybrid nDCG for EVALUATION ONLY (not used in training loss).
-    
-    Per AvataRL design doc: "The nDCG relevance scores are generated by giving 
-    the ground-truth token a score of 1.0 and all other tokens a score equal 
-    to their probability under the teacher's distribution."
-    
-    Args:
-        student_logits: Student model's logits [batch_size * seq_len, vocab_size]
-        teacher_logits: Teacher model's logits [batch_size * seq_len, vocab_size]
-        ground_truth_indices: Ground truth token indices [batch_size * seq_len]
-        k: Top-k positions to consider for nDCG calculation
-    
-    Returns:
-        Average nDCG score across the batch
-    """
-    batch_size_seq_len, vocab_size = student_logits.shape
-    
-    # Get teacher's probabilities for relevance scores
-    teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
-    
-    # Create relevance scores: 1.0 for ground truth, teacher prob for others
-    relevance_scores = teacher_probs.clone()
-    relevance_scores.scatter_(1, ground_truth_indices.unsqueeze(1), 1.0)
-    
-    # Get student's predicted probabilities and top-k
-    student_probs = torch.nn.functional.softmax(student_logits, dim=-1)
-    _, student_top_k = student_probs.topk(k, dim=-1)
-    
-    # Get ideal ranking (by relevance scores)
-    ideal_relevance, ideal_top_k = relevance_scores.topk(k, dim=-1)
-    
-    # Calculate DCG for student's ranking
-    dcg = 0.0
-    for i in range(k):
-        # Get relevance score for student's i-th ranked item
-        student_choice = student_top_k[:, i:i+1]
-        relevance = relevance_scores.gather(1, student_choice).squeeze(-1)
-        # Add discounted gain
-        dcg += relevance / torch.log2(torch.tensor(i + 2.0, device=student_logits.device))
-    
-    # Calculate ideal DCG (IDCG) - perfect ranking
-    idcg = 0.0
-    for i in range(k):
-        idcg += ideal_relevance[:, i] / torch.log2(torch.tensor(i + 2.0, device=student_logits.device))
-    
-    # Calculate nDCG (avoid division by zero)
-    ndcg = dcg / (idcg + 1e-8)
-    
-    # Return average nDCG across the batch
-    return ndcg.mean().item()
-
 
 # -----------------------------------------------------------------------------
 
@@ -739,9 +601,9 @@ if block_size < model.config.block_size:
     )
 model.to(device)
 
-# Load teacher model for AvataRL
-teacher_model = load_teacher_model(teacher_model_path)
-print(f"Teacher model loaded from {teacher_model_path}")
+# Load critic model for AvataRL
+critic_model = load_critic_model(critic_model_path)
+print(f"Teacher model loaded from {critic_model_path}")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.amp.GradScaler("cuda", enabled=(dtype == "float16"))
@@ -834,7 +696,7 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
-    teacher_model.eval()  # Ensure teacher is in eval mode too
+    critic_model.eval()  # Ensure critic is in eval mode too
     
     for split in ["train", "val"]:
         losses = torch.zeros(eval_iters)
@@ -846,10 +708,10 @@ def estimate_loss():
                 student_logits, _ = model(X, Y)
                 
                 with torch.no_grad():
-                    teacher_logits, _ = teacher_model(X, Y)
+                    critic_logits, _ = critic_model(X, Y)
                 
                 loss, _ = compute_avatarl_loss(
-                    student_logits, teacher_logits, Y,
+                    student_logits, critic_logits, Y,
                     reality_weight=reality_weight,
                     mentor_weight=mentor_weight,
                     label_smoothing_epsilon=label_smoothing_epsilon,
@@ -869,7 +731,7 @@ def estimate_loss():
         out[f"{split}_ce"] = ce_losses.mean()
     
     model.train()
-    teacher_model.eval()
+    critic_model.eval()
     return out
 
 
@@ -1032,17 +894,17 @@ with profiler:
                     micro_step == gradient_accumulation_steps - 1
                 )
             with ctx:
-                # Get student and teacher logits - we need full sequence, so pass targets
+                # Get student and critic logits - we need full sequence, so pass targets
                 # but we'll ignore the returned loss and compute our own AvataRL loss
                 student_logits, _ = model(X, Y)
                 
-                # Get teacher logits for AvataRL
+                # Get critic logits for AvataRL
                 with torch.no_grad():
-                    teacher_logits, _ = teacher_model(X, Y)
+                    critic_logits, _ = critic_model(X, Y)
                 
                 # Compute AvataRL loss
                 loss, avatarl_metrics = compute_avatarl_loss(
-                    student_logits, teacher_logits, Y,
+                    student_logits, critic_logits, Y,
                     reality_weight=reality_weight,
                     mentor_weight=mentor_weight,
                     label_smoothing_epsilon=label_smoothing_epsilon,
@@ -1099,19 +961,19 @@ with profiler:
 
             if local_iter_num >= 5:
                 # In AvataRL, we do more computation than standard training:
-                # 1. Additional teacher forward pass (roughly +0.5x FLOPs since no backward)
+                # 1. Additional critic forward pass (roughly +0.5x FLOPs since no backward)
                 # 2. Computing gradients for top_k actions instead of 1 per position
                 # 
                 # FIXED: Correct FLOP accounting for AvataRL
                 # Standard training: 1x forward + 2x backward = 3x FLOPs
-                # AvataRL: 1x student forward + 2x student backward + 1x teacher forward = 4x FLOPs
+                # AvataRL: 1x student forward + 2x student backward + 1x critic forward = 4x FLOPs
                 # The action space operations (gather/scatter) are memory-bound, not compute-bound
-                teacher_overhead = 4.0 / 3.0  # 1.33x for teacher forward (4x total / 3x standard)
+                critic_overhead = 4.0 / 3.0  # 1.33x for critic forward (4x total / 3x standard)
                 avatarl_overhead = 1.5  # Conservative estimate for AvataRL-specific ops (softmax, gather, rewards)
                 
                 # Combined multiplier: ~2x instead of incorrect 12x
-                avatarl_multiplier = teacher_overhead * avatarl_overhead  # ~2.0x
-                # This reflects actual compute: teacher forward + loss computation overhead
+                avatarl_multiplier = critic_overhead * avatarl_overhead  # ~2.0x
+                # This reflects actual compute: critic forward + loss computation overhead
                 # NOT top_k forward passes (which don't happen)
                 
                 mfu = raw_model.estimate_mfu(
