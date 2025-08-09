@@ -192,15 +192,10 @@ nanogpt/
 # macOS
 .DS_Store
 
-# bugs, features and experiment tracking
-issues/
-
-# documentation
-docs/
-
 # Performance analysis files
 PERFORMANCE_BOTTLENECKS.md
 
 # Temporary files
 temp/
 AGENTS.md
+archive/

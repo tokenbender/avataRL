@@ -1,6 +1,7 @@
 # avatarl
 
-training a natural language model from random initialization using pure reinforcement learning.
+training language models from scratch with pure reinforcement learning
+read it in depth here - [avatarl.md](https://tokenbender.com/post.html?id=avatarl))
 
 ## overview
 
@@ -84,6 +85,8 @@ modal run modal_train.py:train_avatarl_single_node
 **25july - 06aug25** cleaned up the codebase, essentially i gave avataRL a new avatar. not sorry for the pun. pick up a new idea - referee model that is trained on groundtruth data and is used to score the predictions of the model. this works nicely, converging with reasonable compute expense and referee model does not need to be bigger than the model in training. i announce success of the project.
 
 **07aug25** update everything in public codebase.
+
+**09aug25** completed the article for avatarl.
 
 ## contributing
 
