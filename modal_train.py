@@ -52,7 +52,7 @@ volume_model_output = modal.Volume.from_name(
 # Set this to 1 for single-node training, or higher for multi-node training
 n_nodes = 1  # Changed default to 1 for easier single-node usage
 # Typically this matches the number of GPUs per container.
-n_proc_per_node = 1
+n_proc_per_node = 8
 # RDMA (Remote Direct Memory Access) for faster multi-node communication
 # Set to False if you don't have RDMA permissions on your Modal workspace
 USE_RDMA = False
@@ -130,7 +130,7 @@ def _train_avatarl_single_node():
 
 
 @app.function(
-    gpu=f"H100:{n_proc_per_node}",
+    gpu=f"H200:{n_proc_per_node}",
     secrets=[
         # Required for connecting to Weights & Biases from within the Modal container.
         modal.Secret.from_name("wandb"),

@@ -6,9 +6,12 @@ import time
 # -----------------------------------------------------------------------------
 # I/O
 out_dir = "out"  # Changed to be inside /root/out Modal volume mount
-experiment_name = "avatarl_pretrain_4000_adamw"
-eval_interval = 500
-log_interval = 10
+experiment_name = "avatarl_pretrain_125M_muon"
+
+# Evaluation and logging intervals
+# Can specify as iterations (int) or epochs (float with 'e' suffix in string, e.g., "0.5e" for every half epoch)
+eval_interval = 500  # Evaluate every N iterations (or set to "1.0e" for every epoch)
+log_interval = 10  # Log every N iterations
 eval_iters = 200
 eval_only = False
 always_save_checkpoint = False
@@ -21,27 +24,31 @@ wandb_run_name = "run_" + str(time.time())
 
 # data
 dataset = "openwebtext"  # Use openwebtext to match teacher model's training data
-gradient_accumulation_steps = 32  # Increased from 8 to better utilize GPU (will be divided by world_size)
+gradient_accumulation_steps = 8  # Increased from 8 to better utilize GPU (will be divided by world_size)
 # Note: This will be divided by world_size in DDP, so effective steps per GPU = 4 with 8 GPUs
-batch_size = 16  # Increased from 4 to better utilize GPU memory (adjust down if OOM)
+batch_size = 8  # Increased from 4 to better utilize GPU memory (adjust down if OOM)
 block_size = 512  # Keeping at 512 to balance memory usage with dual models
 
 # model - matching teacher model configuration from train.py
-n_layer = 6  # Same as teacher model
-n_head = 6   # Same as teacher model
-n_embd = 384 # Same as teacher model (GPT-2 medium size)
+n_layer = 16  # Same as teacher model
+n_head = 16   # Same as teacher model
+n_embd = 1024 # Same as teacher model (GPT-2 medium size)
 dropout = 0.0  # No dropout for pretraining
 bias = False
 
 # optimizer
 learning_rate = 6e-4  # Adjusted for better stability with AvataRL
-max_iters = 5000  # Increased for longer training
+
+# Training duration - can specify either max_iters OR max_epochs (not both)
+# If max_epochs is set, max_iters will be calculated automatically based on dataset size
+max_iters = None  # Maximum training iterations (set to None to use max_epochs instead)
+max_epochs = 0.5  # Maximum training epochs (set to None to use max_iters instead)
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0
 # dual optimizer settings
-use_dual_optimizer = True  # Enable dual optimizer (Muon + Adam) matching teacher config
+use_dual_optimizer = False  # Enable dual optimizer (Muon + Adam) matching teacher config
 muon_lr = 0.05  # learning rate for Muon optimizer (hidden matrices)
 muon_momentum = 0.95  # momentum for Muon optimizer
 muon_ns_steps = 5  # Newton-Schulz iteration steps

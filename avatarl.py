@@ -346,6 +346,48 @@ else:
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
+# Calculate epoch information if dataset exists
+try:
+    if os.path.exists(os.path.join(data_dir, "train.bin")):
+        train_tokens = get_dataset_size("train")
+        # Number of sequences we can sample from the dataset
+        num_sequences = train_tokens - block_size + 1
+        # Iterations per epoch = sequences / (batch_size * gradient_accumulation_steps * world_size)
+        iterations_per_epoch = num_sequences // (batch_size * gradient_accumulation_steps * ddp_world_size)
+        tokens_per_epoch = iterations_per_epoch * tokens_per_iter
+        
+        print(f"dataset has {train_tokens:,} tokens")
+        print(f"iterations per epoch: {iterations_per_epoch:,}")
+        print(f"tokens per epoch: {tokens_per_epoch:,}")
+        
+        # Handle max_epochs vs max_iters configuration
+        if 'max_epochs' in globals() and max_epochs is not None:
+            # Calculate max_iters from max_epochs
+            max_iters = int(max_epochs * iterations_per_epoch)
+            print(f"training for {max_epochs} epochs = {max_iters:,} iterations")
+        else:
+            # Show how many epochs the current max_iters represents
+            print(f"with max_iters={max_iters}, training for {max_iters / iterations_per_epoch:.2f} epochs")
+    else:
+        iterations_per_epoch = None
+        print(f"dataset not found at {data_dir}, cannot calculate epoch information")
+        if 'max_epochs' in globals() and max_epochs is not None:
+            print(f"WARNING: max_epochs specified but cannot calculate iterations without dataset")
+except Exception as e:
+    iterations_per_epoch = None
+    print(f"could not calculate epoch information: {e}")
+
+# Safety check: ensure max_iters has a value
+if max_iters is None:
+    if 'max_epochs' in globals() and max_epochs is not None:
+        # If we couldn't calculate iterations_per_epoch, use a reasonable default
+        print(f"WARNING: Cannot calculate iterations from epochs without dataset. Using default max_iters=10000")
+        max_iters = 10000
+    else:
+        # Both max_iters and max_epochs are None - use default
+        print(f"WARNING: Neither max_iters nor max_epochs specified. Using default max_iters=10000")
+        max_iters = 10000
+
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
@@ -489,6 +531,27 @@ class Muon(torch.optim.Optimizer):
 # poor man's data loader
 data_dir = os.path.join("data", dataset)
 
+# Dataset size tracking for epoch calculation
+train_data_size = None
+val_data_size = None
+
+def get_dataset_size(split):
+    """Get the size of a dataset split in tokens"""
+    global train_data_size, val_data_size
+    if split == "train" and train_data_size is not None:
+        return train_data_size
+    elif split == "val" and val_data_size is not None:
+        return val_data_size
+    
+    data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=np.uint16, mode="r")
+    size = len(data)
+    
+    if split == "train":
+        train_data_size = size
+    else:
+        val_data_size = size
+    
+    return size
 
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
@@ -521,6 +584,7 @@ def get_batch(split):
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
+current_epoch = 0  # Initialize epoch counter
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, "meta.pkl")
@@ -585,6 +649,11 @@ elif init_from == "resume":
     model.load_state_dict(state_dict)
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
+    # Restore epoch if present in checkpoint (backward compatibility)
+    if "current_epoch" in checkpoint:
+        current_epoch = checkpoint["current_epoch"]
+    else:
+        current_epoch = 0
 elif init_from.startswith("gpt2"):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -808,6 +877,9 @@ running_avg_reward = 0.0
 training_time_t0 = time.perf_counter()
 with profiler:
     while True:
+        # Update epoch counter
+        if iterations_per_epoch is not None and iter_num > 0:
+            current_epoch = iter_num // iterations_per_epoch
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num) if decay_lr else learning_rate
         
@@ -829,8 +901,9 @@ with profiler:
             training_time_ms += 1000 * (time.perf_counter() - training_time_t0)
 
             losses = estimate_loss()
+            epoch_str = f" (epoch {current_epoch:.2f})" if iterations_per_epoch else ""
             print(
-                f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, val_ce_loss {losses['val_ce']:.4f} train_time:{training_time_ms:.0f}ms"
+                f"step {iter_num}{epoch_str}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, val_ce_loss {losses['val_ce']:.4f} train_time:{training_time_ms:.0f}ms"
             )
             if speedrun and losses["val"] < speedrun_target_eval_loss:
                 print(
@@ -850,6 +923,8 @@ with profiler:
                     "lr": lr,
                     "mfu": running_mfu * 100,  # convert to percentage
                 }
+                if iterations_per_epoch:
+                    log_dict["epoch"] = current_epoch
                 # Add AvataRL metrics if available
                 if 'avatarl_metrics' in locals():
                     log_dict.update({
@@ -870,6 +945,8 @@ with profiler:
                         "best_val_loss": best_val_loss,
                         "config": config,
                         "use_dual_optimizer": use_dual_optimizer,  # Save optimizer type for loading
+                        "current_epoch": current_epoch,  # Save epoch information
+                        "iterations_per_epoch": iterations_per_epoch,  # Save for consistency checks
                     }
                     # Construct checkpoint filename with experiment name suffix
                     checkpoint_filename = "ckpt.pt" if not experiment_name else f"ckpt_{experiment_name}.pt"
@@ -951,7 +1028,8 @@ with profiler:
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
             lossf = loss.item() * gradient_accumulation_steps
 
-            out_str = f"iter {iter_num}: loss {lossf:.4f}, ce_loss {top1_ce_loss.item():.4f}, time {dt * 1000:.2f}ms"
+            epoch_str = f" (epoch {current_epoch:.2f})" if iterations_per_epoch else ""
+            out_str = f"iter {iter_num}{epoch_str}: loss {lossf:.4f}, ce_loss {top1_ce_loss.item():.4f}, time {dt * 1000:.2f}ms"
             
             # Update running averages for AvataRL metrics
             if 'avatarl_metrics' in locals():
@@ -993,7 +1071,7 @@ with profiler:
             profiler.step()
 
         # termination conditions
-        if iter_num > max_iters:
+        if max_iters is not None and iter_num > max_iters:
             break
 
 if ddp:
