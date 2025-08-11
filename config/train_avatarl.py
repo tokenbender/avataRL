@@ -6,7 +6,7 @@ import time
 # -----------------------------------------------------------------------------
 # I/O
 out_dir = "out"  # Changed to be inside /root/out Modal volume mount
-experiment_name = "avatarl_pretrain_250M_adamw"
+experiment_name = "avatarl_pretrain_250M_adamw_big_critic"
 
 # Evaluation and logging intervals
 # Can specify as iterations (int) or epochs (float with 'e' suffix in string, e.g., "0.5e" for every half epoch)
@@ -26,7 +26,7 @@ wandb_run_name = "run_" + str(time.time())
 dataset = "openwebtext"  # Use openwebtext to match teacher model's training data
 gradient_accumulation_steps = 8  # Increased from 8 to better utilize GPU (will be divided by world_size)
 # Note: This will be divided by world_size in DDP, so effective steps per GPU = 4 with 8 GPUs
-batch_size = 8  # Increased from 4 to better utilize GPU memory (adjust down if OOM)
+batch_size = 4  # Increased from 4 to better utilize GPU memory (adjust down if OOM)
 block_size = 512  # Keeping at 512 to balance memory usage with dual models
 
 # model - matching teacher model configuration from train.py
@@ -76,7 +76,7 @@ bench = False  # Whether we're benchmarking - calculates MFU on each iteration
 # -----------------------------------------------------------------------------
 # AvataRL specific parameters
 # -----------------------------------------------------------------------------
-critic_model_path = 'out/ckpt_critic_30M.pt' # Path to the pre-trained critic model
+critic_model_path = 'out/ckpt_wandb_logging_fix.pt' # Path to the pre-trained critic model
 
 # PoE weights
 reality_weight = 0.7
