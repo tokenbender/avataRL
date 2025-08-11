@@ -50,7 +50,7 @@ config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
 
-def load_critic_model(checkpoint_path: str):
+def load_critic_model(checkpoint_path: str, device: str):
     """
     Load a pre-trained critic model from checkpoint.
     
@@ -58,12 +58,12 @@ def load_critic_model(checkpoint_path: str):
         checkpoint_path: Path to the critic model checkpoint
         
     Returns:
-        critic_model: Loaded critic model in eval mode on CUDA
+        critic_model: Loaded critic model in eval mode on specified device
     """
     print(f"Loading critic model from {checkpoint_path}")
     
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cuda')
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     checkpoint_model_args = checkpoint["model_args"]
     
     # Create model with checkpoint config
@@ -79,7 +79,7 @@ def load_critic_model(checkpoint_path: str):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     
     critic_model.load_state_dict(state_dict)
-    critic_model.cuda()
+    critic_model.to(device)
     critic_model.eval()  # Set to eval mode
     
     # Disable gradients for critic
@@ -100,7 +100,8 @@ def compute_avatarl_loss(
     label_smoothing_epsilon: float = 0.1,
     reward_scale: float = 100.0,
     top_k: int = 16,
-    entropy_coefficient: float = 0.01
+    entropy_coefficient: float = 0.01,
+    confidence_adaptive: bool = True,
 ) -> Tensor:
     """
     Compute the AvataRL policy gradient loss with active token label smoothing.
@@ -180,54 +181,61 @@ def compute_avatarl_loss(
             masked = masked[:max_actions]
         action_space_indices.append(masked.tolist())
     
-    # --- Step 2: Construct the Ideal Reward Distribution (PoE Model) ---
-    # Get mentor (critic) probabilities
+    # --- Step 2: Prepare padded indices for action space (needed for confidence) ---
+    max_actions = max(len(seq) for seq in action_space_indices)
+    padded_indices = torch.zeros((len(action_space_indices), max_actions), dtype=torch.long, device=student_logits.device)
+    action_masks = torch.zeros((len(action_space_indices), max_actions), dtype=torch.bool, device=student_logits.device)
+    for i, indices in enumerate(action_space_indices):
+        padded_indices[i, :len(indices)] = torch.tensor(indices, device=student_logits.device)
+        action_masks[i, :len(indices)] = True
+
+    # --- Step 3: Construct the Ideal Reward Distribution (PoE Model) ---
+    eps = 1e-8
+    # Get mentor (critic) probabilities over full vocab
     mentor_probs = torch.nn.functional.softmax(critic_logits_flat, dim=-1)
-    
-    # VECTORIZED: Create reality expert distribution with ACTIVE TOKEN label smoothing
-    # Instead of spreading epsilon across all vocab_size tokens, concentrate it on active tokens only
+
+    # Compute teacher confidence c(s) per position using normalized entropy over action set A
+    # Gather mentor probs on action set and renormalize on A
+    mentor_action_probs_raw = mentor_probs.gather(1, padded_indices)
+    mentor_action_probs_masked = mentor_action_probs_raw * action_masks.float()
+    mentor_action_probs_sum = mentor_action_probs_masked.sum(dim=1, keepdim=True)
+    mentor_action_probs = mentor_action_probs_masked / (mentor_action_probs_sum + eps)
+    # Entropy on A
+    mentor_action_log_probs = torch.log(mentor_action_probs + eps)
+    H_crit = -(mentor_action_probs * mentor_action_log_probs).sum(dim=1, keepdim=True)
+    valid_action_counts = action_masks.sum(dim=1, keepdim=True).float()
+    # Avoid divide-by-zero when |A|=1: define normalized entropy 0 in that case
+    denom = torch.where(valid_action_counts > 1.0, torch.log(valid_action_counts + eps), torch.ones_like(valid_action_counts))
+    normalized_entropy = torch.where(valid_action_counts > 1.0, H_crit / denom, torch.zeros_like(H_crit))
+    confidence = (1.0 - normalized_entropy).clamp(0.0, 1.0)  # c(s) in [0,1]
+
+    # Create reality expert distribution with ACTIVE TOKEN label smoothing over full vocab
     reality_probs = torch.zeros_like(mentor_probs)
-    
-    # Batch process all positions at once to avoid Python loops
-    # First, set ground truth probabilities for all positions
     batch_indices = torch.arange(batch_size_seq, device=reality_probs.device)
     reality_probs[batch_indices, ground_truth_flat] = 1.0 - label_smoothing_epsilon
-    
-    # Process each position's active tokens (still need loop but optimized)
     for i, active_indices in enumerate(action_space_indices):
         if len(active_indices) > 1:
             active_indices_tensor = torch.tensor(active_indices, device=reality_probs.device, dtype=torch.long)
             num_active = len(active_indices)
-            
-            # Distribute epsilon mass uniformly among non-ground-truth active tokens
             smoothing_per_token = label_smoothing_epsilon / (num_active - 1)
-            
-            # Set smoothing for all active tokens first
             reality_probs[i, active_indices_tensor] = smoothing_per_token
-            
-            # Restore ground truth probability (overwrites the smoothing for GT token)
             reality_probs[i, ground_truth_flat[i]] = 1.0 - label_smoothing_epsilon
         elif len(active_indices) == 1:
-            # Edge case: only ground truth is active
             reality_probs[i, ground_truth_flat[i]] = 1.0
+
+    # Combine experts using weighted geometric mean with optional confidence adaptivity
+    # If confidence_adaptive=True: w_m = c, w_r = 1 - c (per position). Else: fixed weights.
+    if confidence_adaptive:
+        w_m = confidence  # [N,1]
+        w_r = 1.0 - confidence  # [N,1]
+    else:
+        w_m = torch.full_like(confidence, mentor_weight)
+        w_r = torch.full_like(confidence, reality_weight)
+
+    ideal_probs = torch.pow(reality_probs + eps, w_r) * torch.pow(mentor_probs + eps, w_m)
+    # Note: Do not normalize over full vocabulary here. We'll renormalize on A below.
     
-    # Combine experts using weighted geometric mean
-    # P_ideal ∝ P_reality^0.7 * P_mentor^0.3
-    ideal_probs = torch.pow(reality_probs, reality_weight) * torch.pow(mentor_probs, mentor_weight)
-    
-    # CRITICAL FIX: Don't normalize over full vocabulary here!
-    # We'll normalize only over action space tokens below
-    
-    # Pad sequences to same length for batch processing
-    max_actions = max(len(seq) for seq in action_space_indices)
-    padded_indices = torch.zeros((len(action_space_indices), max_actions), dtype=torch.long, device=student_logits.device)
-    action_masks = torch.zeros((len(action_space_indices), max_actions), dtype=torch.bool, device=student_logits.device)
-    
-    for i, indices in enumerate(action_space_indices):
-        padded_indices[i, :len(indices)] = torch.tensor(indices, device=student_logits.device)
-        action_masks[i, :len(indices)] = True
-    
-    # --- Step 3: Generate Positive Rewards ---
+    # --- Step 4: Generate Positive Rewards ---
     # Extract raw probabilities for action space tokens only
     action_probs_raw = ideal_probs.gather(1, padded_indices)
     
@@ -269,7 +277,7 @@ def compute_avatarl_loss(
     # Apply proportional rescaling to maintain relative differences
     action_rewards = action_rewards * rescale_factor
     
-    # --- Step 4: Calculate Policy Gradient Loss ---
+    # --- Step 5: Calculate Policy Gradient Loss ---
     # OPTIMIZED: Compute softmax once and derive log_softmax from it
     student_probs = torch.nn.functional.softmax(student_logits_flat, dim=-1)
     student_log_probs = torch.log(student_probs + 1e-10)  # Add small epsilon for numerical stability
@@ -288,14 +296,14 @@ def compute_avatarl_loss(
     num_valid_actions = action_masks.sum(dim=1).float()
     policy_gradient_loss = policy_gradient_loss / (num_valid_actions + 1e-8)
     
-    # --- Step 5: Add Entropy Regularization ---
+    # --- Step 6: Add Entropy Regularization ---
     # Calculate entropy of student's full distribution (reuse cached probs and log_probs)
     student_entropy = -(student_probs * student_log_probs).sum(dim=-1)
     
     # Entropy bonus (negative because we minimize loss)
     entropy_bonus = entropy_coefficient * student_entropy
     
-    # --- Step 6: Combine Losses ---
+    # --- Step 7: Combine Losses ---
     # Total loss = policy gradient loss - entropy bonus
     total_loss = (policy_gradient_loss - entropy_bonus).mean()
     
@@ -671,11 +679,11 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # Load critic model for AvataRL
-critic_model = load_critic_model(critic_model_path)
+critic_model = load_critic_model(critic_model_path, device)
 print(f"Teacher model loaded from {critic_model_path}")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.amp.GradScaler("cuda", enabled=(dtype == "float16"))
+scaler = torch.amp.GradScaler(device_type, enabled=(dtype == "float16" and device_type == "cuda"))
 
 # optimizer
 if use_dual_optimizer:
@@ -897,7 +905,8 @@ with profiler:
         # evaluate the loss on train/val sets and write checkpoints
         if iter_num % eval_interval == 0 and master_process:
             # stop the clock
-            torch.cuda.synchronize()
+            if device_type == "cuda":
+                torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - training_time_t0)
 
             losses = estimate_loss()
@@ -954,7 +963,8 @@ with profiler:
                     print(f"saving checkpoint to {checkpoint_path}")
                     torch.save(checkpoint, checkpoint_path)
             # start the clock again
-            torch.cuda.synchronize()
+            if device_type == "cuda":
+                torch.cuda.synchronize()
             training_time_t0 = time.perf_counter()
         if iter_num == 0 and eval_only:
             break
