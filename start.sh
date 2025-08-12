@@ -86,22 +86,8 @@ if [ ! -f "$DATA_DIR/train.bin" ] || [ ! -f "$DATA_DIR/val.bin" ]; then
     echo "Data downloaded successfully!"
 fi
 
-# Check for teacher model (only needed for AvataRL)
+# Check for critic model (only needed for AvataRL)
 if [ "$SCRIPT" = "avatarl" ]; then
-    TEACHER_MODEL="out/ckpt_teacher_25M.pt"
-    if [ ! -f "$TEACHER_MODEL" ]; then
-        echo
-        echo "WARNING: Teacher model not found at $TEACHER_MODEL"
-        echo "AvataRL requires a pre-trained teacher model."
-        echo "Please ensure the teacher model exists or update the path in config/train_avatarl.py"
-        echo
-        read -p "Continue anyway? (y/n) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
-    fi
-    
     # Check for critic model and download based on experiment name
     echo
     echo "=== Checking Critic Model ==="
