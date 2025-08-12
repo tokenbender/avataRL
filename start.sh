@@ -29,9 +29,9 @@ fi
 
 # Install dependencies if needed
 echo "=== Checking Dependencies ==="
-python -c "import torch; print(f'PyTorch {torch.__version__} installed')" || {
+python3 -c "import torch; print(f'PyTorch {torch.__version__} installed')" || {
     echo "Installing PyTorch and dependencies..."
-    pip install torch==2.6.0 \
+    pip3 install torch==2.6.0 \
         transformers==4.51.3 \
         datasets==3.6.0 \
         tiktoken==0.9.0 \
@@ -50,7 +50,7 @@ if [ ! -f "$DATA_DIR/train.bin" ] || [ ! -f "$DATA_DIR/val.bin" ]; then
     mkdir -p $DATA_DIR
     
     # Run data preparation
-    python $DATA_DIR/prepare.py
+    python3 $DATA_DIR/prepare.py
 fi
 
 # Check for teacher model (only needed for AvataRL)
@@ -94,7 +94,7 @@ case $MODE in
         if [ $GPUS -eq 1 ]; then
             # Single GPU - run directly with python
             echo "Running on single GPU..."
-            python $TRAIN_SCRIPT --compile=False
+            python3 $TRAIN_SCRIPT --compile=False
         else
             # Multi-GPU single node
             echo "Running on $GPUS GPUs (single node)..."
