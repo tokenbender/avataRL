@@ -43,14 +43,47 @@ python3 -c "import torch; print(f'PyTorch {torch.__version__} installed')" || {
 DATA_DIR="data/openwebtext"
 if [ ! -f "$DATA_DIR/train.bin" ] || [ ! -f "$DATA_DIR/val.bin" ]; then
     echo
-    echo "ERROR: OpenWebText data not found at $DATA_DIR"
-    echo "Please prepare the data first by running:"
-    echo "  python3 $DATA_DIR/prepare.py"
-    echo
-    echo "Or if using Modal:"
-    echo "  modal run modal_train.py::prepare_data"
-    echo
-    exit 1
+    echo "Data not found at $DATA_DIR, downloading from HuggingFace..."
+    
+    # Create data directory if it doesn't exist
+    mkdir -p "$DATA_DIR"
+    
+    # Download train.bin and val.bin from HuggingFace
+    # Use wget if available, otherwise fall back to curl
+    if command -v wget &> /dev/null; then
+        echo "Downloading train.bin (604 kB)..."
+        wget -q --show-progress -O "$DATA_DIR/train.bin" \
+            "https://huggingface.co/datasets/TokenBender/avataRL/resolve/main/train.bin" || {
+            echo "ERROR: Failed to download train.bin"
+            exit 1
+        }
+        
+        echo "Downloading val.bin (72.1 kB)..."
+        wget -q --show-progress -O "$DATA_DIR/val.bin" \
+            "https://huggingface.co/datasets/TokenBender/avataRL/resolve/main/val.bin" || {
+            echo "ERROR: Failed to download val.bin"
+            exit 1
+        }
+    elif command -v curl &> /dev/null; then
+        echo "Downloading train.bin (604 kB)..."
+        curl -L -o "$DATA_DIR/train.bin" \
+            "https://huggingface.co/datasets/TokenBender/avataRL/resolve/main/train.bin" || {
+            echo "ERROR: Failed to download train.bin"
+            exit 1
+        }
+        
+        echo "Downloading val.bin (72.1 kB)..."
+        curl -L -o "$DATA_DIR/val.bin" \
+            "https://huggingface.co/datasets/TokenBender/avataRL/resolve/main/val.bin" || {
+            echo "ERROR: Failed to download val.bin"
+            exit 1
+        }
+    else
+        echo "ERROR: Neither wget nor curl is installed. Please install one to download data."
+        exit 1
+    fi
+    
+    echo "Data downloaded successfully!"
 fi
 
 # Check for teacher model (only needed for AvataRL)
