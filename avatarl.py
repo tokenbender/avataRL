@@ -346,6 +346,31 @@ else:
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
+# Define data directory for dataset
+data_dir = os.path.join("data", dataset)
+
+# Dataset size tracking for epoch calculation
+train_data_size = None
+val_data_size = None
+
+def get_dataset_size(split):
+    """Get the size of a dataset split in tokens"""
+    global train_data_size, val_data_size
+    if split == "train" and train_data_size is not None:
+        return train_data_size
+    elif split == "val" and val_data_size is not None:
+        return val_data_size
+    
+    data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=np.uint16, mode="r")
+    size = len(data)
+    
+    if split == "train":
+        train_data_size = size
+    else:
+        val_data_size = size
+    
+    return size
+
 # Calculate epoch information if dataset exists
 try:
     if os.path.exists(os.path.join(data_dir, "train.bin")):
@@ -529,29 +554,6 @@ class Muon(torch.optim.Optimizer):
 
 # -----------------------------------------------------------------------------
 # poor man's data loader
-data_dir = os.path.join("data", dataset)
-
-# Dataset size tracking for epoch calculation
-train_data_size = None
-val_data_size = None
-
-def get_dataset_size(split):
-    """Get the size of a dataset split in tokens"""
-    global train_data_size, val_data_size
-    if split == "train" and train_data_size is not None:
-        return train_data_size
-    elif split == "val" and val_data_size is not None:
-        return val_data_size
-    
-    data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=np.uint16, mode="r")
-    size = len(data)
-    
-    if split == "train":
-        train_data_size = size
-    else:
-        val_data_size = size
-    
-    return size
 
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
