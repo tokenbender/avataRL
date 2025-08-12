@@ -109,3 +109,7 @@ if you find this work useful in your research, please consider citing:
   url = {https://github.com/tokenbender/avatarl}
 }
 ```
+
+## credits
+
+this implementation reuses some code from the [modal labs multinode training guide for nanogpt](https://github.com/modal-labs/multinode-training-guide/tree/main/nanoGPT) as base for avataRL.
