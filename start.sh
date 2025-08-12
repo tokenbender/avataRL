@@ -43,14 +43,14 @@ python3 -c "import torch; print(f'PyTorch {torch.__version__} installed')" || {
 DATA_DIR="data/openwebtext"
 if [ ! -f "$DATA_DIR/train.bin" ] || [ ! -f "$DATA_DIR/val.bin" ]; then
     echo
-    echo "=== Preparing Data ==="
-    echo "OpenWebText data not found. Preparing..."
-    
-    # Create data directory if it doesn't exist
-    mkdir -p $DATA_DIR
-    
-    # Run data preparation
-    python3 $DATA_DIR/prepare.py
+    echo "ERROR: OpenWebText data not found at $DATA_DIR"
+    echo "Please prepare the data first by running:"
+    echo "  python3 $DATA_DIR/prepare.py"
+    echo
+    echo "Or if using Modal:"
+    echo "  modal run modal_train.py::prepare_data"
+    echo
+    exit 1
 fi
 
 # Check for teacher model (only needed for AvataRL)
