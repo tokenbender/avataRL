@@ -9,13 +9,6 @@ set -e  # Exit on error
 echo "=== AvataRL Local Training Script ==="
 echo
 
-# Check if we're in the right directory
-if [ ! -f "nanogpt/avatarl.py" ]; then
-    echo "Error: Please run this script from the tokenopia root directory"
-    echo "Current directory: $(pwd)"
-    exit 1
-fi
-
 # Parse command line arguments
 GPUS=${1:-1}  # Default to 1 GPU if not specified
 MODE=${2:-"single"}  # Default to single node
