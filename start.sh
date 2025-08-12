@@ -92,6 +92,19 @@ if [ "$SCRIPT" = "avatarl" ]; then
     echo
     echo "=== Checking Critic Model ==="
     
+    # Extract critic model path from config
+    CRITIC_PATH=$(python3 -c "
+import sys
+sys.path.insert(0, 'config')
+try:
+    from train_avatarl import critic_model_path
+    print(critic_model_path)
+except:
+    print('out/ckpt_wandb_logging_fix.pt')
+" 2>/dev/null)
+    
+    echo "Config expects critic at: $CRITIC_PATH"
+    
     # Extract experiment name from config
     EXPERIMENT_NAME=$(python3 -c "
 import sys
@@ -144,14 +157,13 @@ except:
             ;;
     esac
     
-    # Check if critic model exists, download if not
-    CRITIC_PATH="out/$CRITIC_FILE"
+    # Check if critic model exists at the config-specified path
     if [ ! -f "$CRITIC_PATH" ]; then
         echo "Critic model not found at $CRITIC_PATH"
-        echo "Downloading from HuggingFace..."
+        echo "Downloading $CRITIC_FILE from HuggingFace..."
         
-        # Create out directory if it doesn't exist
-        mkdir -p out
+        # Create directory if it doesn't exist (handles any path, not just 'out/')
+        mkdir -p $(dirname "$CRITIC_PATH")
         
         # Download the critic model from HuggingFace
         # Check if HF_TOKEN is set for authentication
@@ -209,22 +221,6 @@ except:
         echo "Critic model downloaded successfully!"
     else
         echo "Critic model found at $CRITIC_PATH"
-    fi
-    
-    # Update the critic_model_path in config if it doesn't match
-    CONFIG_CRITIC_PATH=$(python3 -c "
-import sys
-sys.path.insert(0, 'config')
-try:
-    from train_avatarl import critic_model_path
-    print(critic_model_path)
-except:
-    print('out/ckpt_wandb_logging_fix.pt')
-" 2>/dev/null)
-    
-    if [ "$CONFIG_CRITIC_PATH" != "$CRITIC_PATH" ]; then
-        echo "Note: Config expects critic at '$CONFIG_CRITIC_PATH' but we have it at '$CRITIC_PATH'"
-        echo "You may need to update critic_model_path in config/train_avatarl.py"
     fi
 fi
 
