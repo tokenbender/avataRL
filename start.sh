@@ -154,22 +154,53 @@ except:
         mkdir -p out
         
         # Download the critic model from HuggingFace
+        # Check if HF_TOKEN is set for authentication
+        if [ -n "$HF_TOKEN" ]; then
+            AUTH_HEADER="Authorization: Bearer $HF_TOKEN"
+        else
+            AUTH_HEADER=""
+        fi
+        
         if command -v wget &> /dev/null; then
-            wget -q --show-progress -O "$CRITIC_PATH" \
-                "https://huggingface.co/TokenBender/avataRL-critic/resolve/main/$CRITIC_FILE" || {
-                echo "ERROR: Failed to download critic model $CRITIC_FILE"
-                echo "Please check your internet connection or download manually from:"
-                echo "https://huggingface.co/TokenBender/avataRL-critic"
-                exit 1
-            }
+            if [ -n "$AUTH_HEADER" ]; then
+                wget -q --show-progress --header="$AUTH_HEADER" -O "$CRITIC_PATH" \
+                    "https://huggingface.co/TokenBender/avataRL-critic/resolve/main/$CRITIC_FILE" || {
+                    echo "ERROR: Failed to download critic model $CRITIC_FILE"
+                    echo "Please check your internet connection or download manually from:"
+                    echo "https://huggingface.co/TokenBender/avataRL-critic"
+                    echo "If the repo is private, set HF_TOKEN environment variable"
+                    exit 1
+                }
+            else
+                wget -q --show-progress -O "$CRITIC_PATH" \
+                    "https://huggingface.co/TokenBender/avataRL-critic/resolve/main/$CRITIC_FILE" || {
+                    echo "ERROR: Failed to download critic model $CRITIC_FILE"
+                    echo "Please check your internet connection or download manually from:"
+                    echo "https://huggingface.co/TokenBender/avataRL-critic"
+                    echo "If the repo is private, set HF_TOKEN environment variable"
+                    exit 1
+                }
+            fi
         elif command -v curl &> /dev/null; then
-            curl -L --progress-bar -o "$CRITIC_PATH" \
-                "https://huggingface.co/TokenBender/avataRL-critic/resolve/main/$CRITIC_FILE" || {
-                echo "ERROR: Failed to download critic model $CRITIC_FILE"
-                echo "Please check your internet connection or download manually from:"
-                echo "https://huggingface.co/TokenBender/avataRL-critic"
-                exit 1
-            }
+            if [ -n "$AUTH_HEADER" ]; then
+                curl -L --progress-bar -H "$AUTH_HEADER" -o "$CRITIC_PATH" \
+                    "https://huggingface.co/TokenBender/avataRL-critic/resolve/main/$CRITIC_FILE" || {
+                    echo "ERROR: Failed to download critic model $CRITIC_FILE"
+                    echo "Please check your internet connection or download manually from:"
+                    echo "https://huggingface.co/TokenBender/avataRL-critic"
+                    echo "If the repo is private, set HF_TOKEN environment variable"
+                    exit 1
+                }
+            else
+                curl -L --progress-bar -o "$CRITIC_PATH" \
+                    "https://huggingface.co/TokenBender/avataRL-critic/resolve/main/$CRITIC_FILE" || {
+                    echo "ERROR: Failed to download critic model $CRITIC_FILE"
+                    echo "Please check your internet connection or download manually from:"
+                    echo "https://huggingface.co/TokenBender/avataRL-critic"
+                    echo "If the repo is private, set HF_TOKEN environment variable"
+                    exit 1
+                }
+            fi
         else
             echo "ERROR: Neither wget nor curl is installed. Please install one to download the critic model."
             exit 1
