@@ -26,6 +26,24 @@ and we might be creating lots of unorthodox things here, as any fun loving perso
 - `start.sh` - local training launcher to run experiments with environment setup and multi-gpu support
 - `docs/avatarl.md` - technical documentation explaining the avatarl framework and positive reinforce approach
 
+## directory structure
+
+```
+avatarl/
+├── data/
+│   └── openwebtext/
+│       ├── train.bin
+│       └── val.bin
+├── out/
+│   └── ckpt_*.pt
+├── out-avatarl/
+│   └── ckpt_*.pt
+└── config/
+    └── train_avatarl.py
+```
+
+**Note**: `start.sh` automatically downloads training data and critic models from HuggingFace if not present.
+
 ## requirements
 
 ### modal cloud (recommended)
@@ -65,6 +83,29 @@ modal setup
 
 # run training
 modal run modal_train.py:train_avatarl_single_node
+```
+
+## sampling from trained models
+
+sample.py looks for checkpoints in the `out/` directory by default. The checkpoint filename is constructed as `ckpt_{experiment_name}.pt`.
+
+```bash
+# generate text from a trained checkpoint (looks in out/ckpt_avatarl_pretrain_250M_adamw_big_critic.pt)
+python3 sample.py --experiment_name=avatarl_pretrain_250M_adamw_big_critic --start="The true meaning of life is often hidden in"
+
+# additional options
+python3 sample.py \
+  --experiment_name=avatarl_pretrain_250M_adamw_big_critic \
+  --start="Once upon a time" \
+  --temperature=0.8 \
+  --num_samples=5 \
+  --max_new_tokens=200
+
+# use a different output directory
+python3 sample.py \
+  --out_dir=out-avatarl \
+  --experiment_name=avatarl_pretrain \
+  --start="To be or not to be"
 ```
 
 ## progress
