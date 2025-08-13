@@ -203,3 +203,7 @@ archive/
 # Data and output directories
 openwebtext/
 out/
+out-avatarl/
+data/
+scripts/
+wandb/
