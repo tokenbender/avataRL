@@ -19,11 +19,13 @@ and we might be creating lots of unorthodox things here, as any fun loving perso
 ## key files
 
 - `avatarl.py` - main training script implementing avatarl reinforcement learning algorithm for language model pretraining
+- `train.py` - standard pretraining script for creating baseline models for ablation studies
 - `model.py` - gpt model architecture with transformer blocks, attention, and language modeling head
 - `config/train_avatarl.py` - training configuration for avatarl experiments (hyperparameters, model size, optimizer settings)
 - `configurator.py` - command-line configuration override system for experiment management
 - `modal_train.py` - modal cloud deployment for distributed training, profiling and ~~benchmaxxing~~ benchmarking.
 - `start.sh` - local training launcher to run experiments with environment setup and multi-gpu support
+- `evaluate_critic.py` / `modal_evaluate_critic.py` - evaluate critic model cross-entropy loss and perplexity on validation data
 - `docs/avatarl.md` - technical documentation explaining the avatarl framework and positive reinforce approach
 
 ## directory structure
