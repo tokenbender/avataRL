@@ -377,8 +377,8 @@ try:
         train_tokens = get_dataset_size("train")
         # Number of sequences we can sample from the dataset
         num_sequences = train_tokens - block_size + 1
-        # Iterations per epoch = sequences / (batch_size * gradient_accumulation_steps * world_size)
-        iterations_per_epoch = num_sequences // (batch_size * gradient_accumulation_steps * ddp_world_size)
+        # Iterations per epoch = total tokens / tokens consumed per iteration
+        iterations_per_epoch = train_tokens // tokens_per_iter
         tokens_per_epoch = iterations_per_epoch * tokens_per_iter
         
         print(f"dataset has {train_tokens:,} tokens")
