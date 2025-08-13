@@ -36,8 +36,14 @@ def download_file(url: str, fname: str, chunk_size: int = 1024):
 def prepare_shakespeare():
     """
     Prepare the tiny shakespeare dataset.
-    Downloads and tokenizes character-level.
+    Uses GPT-2 BPE tokenizer.
     """
+    try:
+        import tiktoken
+    except ImportError:
+        print("Please install tiktoken: pip install tiktoken")
+        return
+    
     data_dir = Path("data/shakespeare")
     data_dir.mkdir(parents=True, exist_ok=True)
     
@@ -52,23 +58,11 @@ def prepare_shakespeare():
         data = f.read()
     print(f"Length of dataset in characters: {len(data):,}")
     
-    # Character-level tokenization
-    chars = sorted(list(set(data)))
-    vocab_size = len(chars)
-    print(f"Vocabulary size: {vocab_size}")
-    print(f"Vocabulary: {''.join(chars)}")
-    
-    # Create mappings
-    stoi = {ch: i for i, ch in enumerate(chars)}
-    itos = {i: ch for i, ch in enumerate(chars)}
-    
-    # Encode function
-    def encode(s):
-        return [stoi[c] for c in s]
-    
-    # Encode entire text
-    train_ids = encode(data)
+    # Use GPT-2 tokenizer
+    enc = tiktoken.get_encoding("gpt2")
+    train_ids = enc.encode_ordinary(data)
     print(f"Total tokens: {len(train_ids):,}")
+    print(f"Vocab size: {enc.n_vocab}")
     
     # Split into train and val (90/10)
     n = len(train_ids)
@@ -79,14 +73,7 @@ def prepare_shakespeare():
     train_data.tofile(data_dir / "train.bin")
     val_data.tofile(data_dir / "val.bin")
     
-    # Save meta information
-    meta = {
-        "vocab_size": vocab_size,
-        "itos": itos,
-        "stoi": stoi,
-    }
-    with open(data_dir / "meta.pkl", "wb") as f:
-        pickle.dump(meta, f)
+    # No meta.pkl needed - train.py will default to GPT-2 vocab
     
     print(f"Train tokens: {len(train_data):,}")
     print(f"Val tokens: {len(val_data):,}")
@@ -163,13 +150,12 @@ def prepare_openwebtext():
     print(f"Train tokens: {tokenized['train']['len'].sum():,}")
     print(f"Val tokens: {tokenized['val']['len'].sum():,}")
 
-def prepare_custom(data_path: str, tokenizer: str = "gpt2"):
+def prepare_custom(data_path: str):
     """
-    Prepare a custom text dataset.
+    Prepare a custom text dataset using GPT-2 tokenizer.
     
     Args:
         data_path: Path to a text file or directory of text files
-        tokenizer: Tokenizer to use ("gpt2" or "character")
     """
     import tiktoken
     from pathlib import Path
@@ -195,18 +181,10 @@ def prepare_custom(data_path: str, tokenizer: str = "gpt2"):
     data_dir = Path(f"data/{dataset_name}")
     data_dir.mkdir(parents=True, exist_ok=True)
     
-    if tokenizer == "character":
-        # Character-level tokenization
-        chars = sorted(list(set(text)))
-        vocab_size = len(chars)
-        stoi = {ch: i for i, ch in enumerate(chars)}
-        encode = lambda s: [stoi[c] for c in s]
-        tokens = encode(text)
-    else:
-        # BPE tokenization
-        enc = tiktoken.get_encoding(tokenizer)
-        tokens = enc.encode_ordinary(text)
-        vocab_size = enc.n_vocab
+    # Use GPT-2 tokenization
+    enc = tiktoken.get_encoding("gpt2")
+    tokens = enc.encode_ordinary(text)
+    vocab_size = enc.n_vocab
     
     # Convert to numpy array
     tokens = np.array(tokens, dtype=np.uint16)
@@ -295,15 +273,7 @@ if __name__ == "__main__":
         "--dataset",
         type=str,
         default="shakespeare",
-        choices=["shakespeare", "openwebtext"],
-        help="Which dataset to prepare (or path to custom text file/directory)",
-    )
-    parser.add_argument(
-        "--tokenizer",
-        type=str,
-        default="gpt2",
-        choices=["gpt2", "character"],
-        help="Tokenizer to use for custom datasets",
+        help="Which dataset to prepare: 'shakespeare', 'openwebtext', or path to custom text file/directory",
     )
     
     args = parser.parse_args()
@@ -313,7 +283,7 @@ if __name__ == "__main__":
     elif args.dataset == "openwebtext":
         prepare_openwebtext()
     else:
-        prepare_custom(args.dataset, args.tokenizer)
+        prepare_custom(args.dataset)
     
     print("\nTo use this data with Modal, run:")
     print(f"  modal run prepare_data.py::prepare_data_modal --dataset {args.dataset}")

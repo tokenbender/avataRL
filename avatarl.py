@@ -19,7 +19,6 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 import os
 import time
 import math
-import pickle
 from contextlib import nullcontext
 
 import numpy as np
@@ -588,14 +587,8 @@ iter_num = 0
 best_val_loss = 1e9
 current_epoch = 0  # Initialize epoch counter
 
-# attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, "meta.pkl")
-meta_vocab_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, "rb") as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta["vocab_size"]
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+# Always use GPT-2 vocab size
+print("Using GPT-2 vocab_size of 50304 (50257 rounded up for efficiency)")
 
 # model init
 model_args = dict(
@@ -604,18 +597,12 @@ model_args = dict(
     n_embd=n_embd,
     block_size=block_size,
     bias=bias,
-    vocab_size=None,
+    vocab_size=50304,  # GPT-2 vocab_size, padded for efficiency
     dropout=dropout,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
     print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print(
-            "defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)"
-        )
-    model_args["vocab_size"] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == "resume":
