@@ -96,12 +96,13 @@ if [ "$SCRIPT" = "avatarl" ]; then
     CRITIC_PATH=$(python3 -c "
 import sys
 sys.path.insert(0, 'config')
-try:
-    from train_avatarl import critic_model_path
-    print(critic_model_path)
-except:
-    print('out/ckpt_wandb_logging_fix.pt')
-" 2>/dev/null)
+from train_avatarl import critic_model_path
+print(critic_model_path)
+" 2>&1) || {
+        echo "ERROR: Failed to read critic_model_path from config/train_avatarl.py"
+        echo "Error details: $CRITIC_PATH"
+        exit 1
+    }
     
     echo "Config expects critic at: $CRITIC_PATH"
     
@@ -109,12 +110,13 @@ except:
     EXPERIMENT_NAME=$(python3 -c "
 import sys
 sys.path.insert(0, 'config')
-try:
-    from train_avatarl import experiment_name
-    print(experiment_name)
-except:
-    print('avatarl_pretrain_250M_adamw_big_critic')
-" 2>/dev/null)
+from train_avatarl import experiment_name
+print(experiment_name)
+" 2>&1) || {
+        echo "ERROR: Failed to read experiment_name from config/train_avatarl.py"
+        echo "Error details: $EXPERIMENT_NAME"
+        exit 1
+    }
     
     echo "Experiment name: $EXPERIMENT_NAME"
     

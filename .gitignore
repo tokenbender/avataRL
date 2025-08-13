@@ -199,3 +199,7 @@ PERFORMANCE_BOTTLENECKS.md
 temp/
 AGENTS.md
 archive/
+
+# Data and output directories
+openwebtext/
+out/
