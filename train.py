@@ -51,12 +51,12 @@ init_from = "scratch"  # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True  # disabled by default
 wandb_project = "nanogpt-avatarl"
-wandb_run_name = "gpt2"  # 'run' + str(time.time())
+wandb_run_name = "run_" + str(time.time())  # 'run' + str(time.time())
 # data
 dataset = "openwebtext"
 gradient_accumulation_steps = 8  # used to simulate larger batch sizes
-batch_size = 4  # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 512
+batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 1024
 # model
 n_layer = 16
 n_head = 16
@@ -67,7 +67,7 @@ bias = False  # do we use bias inside LayerNorm and Linear layers?
 learning_rate = 6e-4  # max learning rate (10x for better Muon dual optimizer alignment)
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
-max_iters = 8000  # Maximum training iterations (set to None to use max_epochs instead)
+max_iters = 20000  # Maximum training iterations (set to None to use max_epochs instead)
 max_epochs = None  # Maximum training epochs (set to None to use max_iters instead)
 weight_decay = 1e-1
 beta1 = 0.9
@@ -84,7 +84,7 @@ adam_scalar_lr = 0.04  # learning rate for scalar parameters
 # learning rate decay settings
 decay_lr = True  # whether to decay the learning rate
 warmup_iters = 200  # how many steps to warm up for
-lr_decay_iters = 5000  # should be ~= max_iters per Chinchilla
+lr_decay_iters = 100000  # should be ~= max_iters per Chinchilla
 min_lr = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = "nccl"  # 'nccl', 'gloo', etc.
@@ -92,11 +92,7 @@ backend = "nccl"  # 'nccl', 'gloo', etc.
 device = (
     "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 )
-dtype = (
-    "bfloat16"
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    else "float16"
-)  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype = "bfloat16"  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 # Whether to profile the model. Profiling is already setup in bench.py but that doesn't
 # work with DDP, we this train.py script also profiles.

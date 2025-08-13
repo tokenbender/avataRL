@@ -26,8 +26,8 @@ wandb_run_name = "run_" + str(time.time())
 dataset = "openwebtext"  # Use openwebtext to match teacher model's training data
 gradient_accumulation_steps = 8  # Increased from 8 to better utilize GPU (will be divided by world_size)
 # Note: This will be divided by world_size in DDP, so effective steps per GPU = 4 with 8 GPUs
-batch_size = 4  # Increased from 4 to better utilize GPU memory (adjust down if OOM)
-block_size = 512  # Keeping at 512 to balance memory usage with dual models
+batch_size = 8  # Increased from 4 to better utilize GPU memory (adjust down if OOM)
+block_size = 1024  # Keeping at 512 to balance memory usage with dual models
 
 # model - matching teacher model configuration from train.py
 n_layer = 16  # Same as teacher model
@@ -41,7 +41,7 @@ learning_rate = 6e-4  # Adjusted for better stability with AvataRL
 
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
-max_iters = 8000  # Maximum training iterations (set to None to use max_epochs instead)
+max_iters = 20000  # Maximum training iterations (set to None to use max_epochs instead)
 max_epochs = None  # Maximum training epochs (set to None to use max_iters instead)
 weight_decay = 1e-1
 beta1 = 0.9
@@ -59,7 +59,7 @@ adam_scalar_lr = 0.04  # learning rate for scalar parameters
 # learning rate decay
 decay_lr = True
 warmup_iters = 200  # Increased to match teacher model
-lr_decay_iters = 5000  # Same as max_iters for full decay
+lr_decay_iters = 100000  # Same as max_iters for full decay
 min_lr = 6e-5  # ~1/10 of learning_rate per Chinchilla
 
 # DDP settings
