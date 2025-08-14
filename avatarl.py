@@ -376,8 +376,8 @@ try:
         train_tokens = get_dataset_size("train")
         # Number of sequences we can sample from the dataset
         num_sequences = train_tokens - block_size + 1
-        # Iterations per epoch = total tokens / tokens consumed per iteration
-        iterations_per_epoch = train_tokens // tokens_per_iter
+        # Iterations per epoch = sequences / (batch_size * gradient_accumulation_steps * world_size)
+        iterations_per_epoch = num_sequences // (batch_size * gradient_accumulation_steps * ddp_world_size)
         tokens_per_epoch = iterations_per_epoch * tokens_per_iter
         
         print(f"dataset has {train_tokens:,} tokens")
@@ -866,9 +866,9 @@ running_avg_reward = 0.0
 training_time_t0 = time.perf_counter()
 with profiler:
     while True:
-        # Update epoch counter
+        # Update epoch counter (use fractional epochs like train.py)
         if iterations_per_epoch is not None and iter_num > 0:
-            current_epoch = iter_num // iterations_per_epoch
+            current_epoch = iter_num / iterations_per_epoch
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num) if decay_lr else learning_rate
         

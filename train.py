@@ -39,7 +39,7 @@ speedrun_target_eval_loss = 3.28
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = "out"
-experiment_name = "regular_pretrain_250M_adamw_big_critic"  # optional experiment name suffix for checkpoint files
+experiment_name = "regular_pretrain_250M_adamw_big_critic_shakespeare"  # optional experiment name suffix for checkpoint files
 # every how many steps to evaluate val loss? 0 for only at the end
 eval_interval = 500 if not speedrun else 125  # 125 is used in modded-nanogpt
 log_interval = 10
@@ -52,10 +52,10 @@ wandb_log = True  # disabled by default
 wandb_project = "nanogpt-avatarl"
 wandb_run_name = "run_" + str(time.time())  # 'run' + str(time.time())
 # data
-dataset = "openwebtext"
+dataset = "shakespeare"
 gradient_accumulation_steps = 8  # used to simulate larger batch sizes
-batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 512
 # model
 n_layer = 16
 n_head = 16
@@ -66,8 +66,8 @@ bias = False  # do we use bias inside LayerNorm and Linear layers?
 learning_rate = 6e-4  # max learning rate (10x for better Muon dual optimizer alignment)
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
-max_iters = 20000  # Maximum training iterations (set to None to use max_epochs instead)
-max_epochs = None  # Maximum training epochs (set to None to use max_iters instead)
+max_iters = None  # Maximum training iterations (set to None to use max_epochs instead)
+max_epochs = 40  # Maximum training epochs (set to None to use max_iters instead)
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
