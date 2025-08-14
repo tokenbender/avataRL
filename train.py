@@ -39,7 +39,7 @@ speedrun_target_eval_loss = 3.28
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = "out"
-experiment_name = "regular_pretrain_250M_adamw_big_critic_shakespeare"  # optional experiment name suffix for checkpoint files
+experiment_name = "regular_pretrain_250M_adamw_big_critic"  # optional experiment name suffix for checkpoint files
 # every how many steps to evaluate val loss? 0 for only at the end
 eval_interval = 500 if not speedrun else 125  # 125 is used in modded-nanogpt
 log_interval = 10
@@ -54,8 +54,8 @@ wandb_run_name = "run_" + str(time.time())  # 'run' + str(time.time())
 # data
 dataset = "shakespeare"
 gradient_accumulation_steps = 8  # used to simulate larger batch sizes
-batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 512
+batch_size = 64  # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 1024
 # model
 n_layer = 16
 n_head = 16
@@ -67,7 +67,8 @@ learning_rate = 6e-4  # max learning rate (10x for better Muon dual optimizer al
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
 max_iters = None  # Maximum training iterations (set to None to use max_epochs instead)
-max_epochs = 40  # Maximum training epochs (set to None to use max_iters instead)
+max_epochs = 1  # Maximum training epochs (set to None to use max_iters instead)
+max_tokens = None  # 50_000_000_000 to drive by tokens instead of epochs/iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -120,6 +121,8 @@ if ddp:
     seed_offset = ddp_rank  # each process gets a different seed
     # world_size number of processes will be training simultaneously, so we can scale
     # down the desired gradient accumulation iterations per process proportionally
+
+
     assert gradient_accumulation_steps % ddp_world_size == 0, (
         f"{gradient_accumulation_steps=} must be divisible by {ddp_world_size=}"
     )
@@ -130,6 +133,10 @@ else:
     seed_offset = 0
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+if 'max_tokens' in globals() and max_tokens is not None and max_iters is None:
+    import math
+    max_iters = math.ceil(max_tokens / tokens_per_iter)
+    print(f"planning for ~{max_tokens:,} tokens ⇒ {max_iters:,} updates")
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 # Calculate epoch information if dataset exists
@@ -143,7 +150,7 @@ try:
         del train_data  # Release memmap
         
         # Number of sequences we can sample from the dataset
-        num_sequences = train_tokens - block_size + 1
+        num_sequences = max(0, train_tokens - block_size)
         # Iterations per epoch = sequences / (batch_size * gradient_accumulation_steps * world_size)
         iterations_per_epoch = num_sequences // (batch_size * gradient_accumulation_steps * ddp_world_size)
         tokens_per_epoch = iterations_per_epoch * tokens_per_iter
@@ -747,9 +754,10 @@ with profiler:
         if iter_num % log_interval == 0 and master_process:
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+            tokens_seen = (iter_num + 1) * tokens_per_iter  # +1 because we log before incrementing iter_num
             lossf = loss.item() * gradient_accumulation_steps
 
-            out_str = f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms"
+            out_str = f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, tokens ~{tokens_seen:,}"
 
             if local_iter_num >= 5:
                 mfu = raw_model.estimate_mfu(
@@ -769,7 +777,7 @@ with profiler:
             profiler.step()
 
         # termination conditions
-        if iter_num > max_iters:
+        if iter_num >= max_iters:
             break
 
 if ddp:
