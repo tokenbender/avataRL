@@ -88,7 +88,7 @@ fi
 
 # Check for critic model (only needed for AvataRL)
 if [ "$SCRIPT" = "avatarl" ]; then
-    # Check for critic model and download based on experiment name
+    # Check for critic model and download if needed
     echo
     echo "=== Checking Critic Model ==="
     
@@ -106,58 +106,9 @@ print(critic_model_path)
     
     echo "Config expects critic at: $CRITIC_PATH"
     
-    # Extract experiment name from config
-    EXPERIMENT_NAME=$(python3 -c "
-import sys
-sys.path.insert(0, 'config')
-from train_avatarl import experiment_name
-print(experiment_name)
-" 2>&1) || {
-        echo "ERROR: Failed to read experiment_name from config/train_avatarl.py"
-        echo "Error details: $EXPERIMENT_NAME"
-        exit 1
-    }
-    
-    echo "Experiment name: $EXPERIMENT_NAME"
-    
-    # Map experiment name to checkpoint file on HuggingFace
-    case $EXPERIMENT_NAME in
-        "avatarl_pretrain_125M_muon")
-            CRITIC_FILE="ckpt_avatarl_pretrain_125M_muon.pt"
-            ;;
-        "avatarl_pretrain_250M_adamw")
-            CRITIC_FILE="ckpt_avatarl_pretrain_250M_adamw.pt"
-            ;;
-        "avatarl_pretrain_250M_adamw_big_critic")
-            CRITIC_FILE="ckpt_avatarl_pretrain_250M_adamw_big_critic.pt"
-            ;;
-        "avatarl_pretrain_4000_adamw")
-            CRITIC_FILE="ckpt_avatarl_pretrain_4000_adamw.pt"
-            ;;
-        "avatarl_pretrain_4000")
-            CRITIC_FILE="ckpt_avatarl_pretrain_4000.pt"
-            ;;
-        "avatarl_pretrain")
-            CRITIC_FILE="ckpt_avatarl_pretrain.pt"
-            ;;
-        "wandb_logging_fix")
-            CRITIC_FILE="ckpt_wandb_logging_fix.pt"
-            ;;
-        "regular_pretrain_250M_adamw_big_critic")
-            CRITIC_FILE="ckpt_regular_pretrain_250M_adamw_big_critic.pt"
-            ;;
-        "pass_k_next_token_loss")
-            CRITIC_FILE="ckpt_pass_k_next_token_loss.pt"
-            ;;
-        "critic_30M")
-            CRITIC_FILE="ckpt_critic_30M.pt"
-            ;;
-        *)
-            # Default to wandb_logging_fix if experiment name doesn't match
-            CRITIC_FILE="ckpt_wandb_logging_fix.pt"
-            echo "Unknown experiment name, using default critic: $CRITIC_FILE"
-            ;;
-    esac
+    # Extract just the filename from the path to use for HuggingFace download
+    CRITIC_FILE=$(basename "$CRITIC_PATH")
+    echo "Critic filename: $CRITIC_FILE"
     
     # Check if critic model exists at the config-specified path
     if [ ! -f "$CRITIC_PATH" ]; then
