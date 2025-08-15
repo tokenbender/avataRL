@@ -6,6 +6,7 @@ from contextlib import nullcontext
 import torch
 import tiktoken
 from model import GPTConfig, GPT
+from load_critic_4bit import load_critic_model_4bit
 
 # -----------------------------------------------------------------------------
 init_from = (
@@ -13,6 +14,7 @@ init_from = (
 )
 out_dir = "out"  # ignored if init_from is not 'resume'
 experiment_name = "avatarl_pretrain_250M_adamw_big_critic_shakespeare"  # optional experiment name suffix for checkpoint files
+use_4bit = False  # whether to load model with 4-bit quantization for memory efficiency
 start = "Romeo, Oh Romeo, where art thou?"  # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10  # number of samples to draw
 max_new_tokens = 500  # number of tokens generated in each sample
@@ -66,16 +68,31 @@ if init_from == "resume":
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
     
-    print(f"Loading checkpoint from {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint["model_args"])
-    model = GPT(gptconf)
-    state_dict = checkpoint["model"]
-    unwanted_prefix = "_orig_mod."
-    for k, v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+    if use_4bit:
+        print(f"Loading checkpoint with 4-bit quantization from {ckpt_path}")
+        model = load_critic_model_4bit(ckpt_path)
+        print(f"Model loaded in 4-bit - memory usage reduced by ~75%")
+    else:
+        print(f"Loading checkpoint from {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        
+        # Extract only what we need and free the rest
+        checkpoint_model_args = checkpoint["model_args"]
+        state_dict = checkpoint["model"]
+        
+        # Free the checkpoint dict immediately - we don't need optimizer states!
+        del checkpoint
+        if device == 'cuda':
+            torch.cuda.empty_cache()
+        
+        gptconf = GPTConfig(**checkpoint_model_args)
+        model = GPT(gptconf)
+        
+        unwanted_prefix = "_orig_mod."
+        for k, v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
+        model.load_state_dict(state_dict)
 elif init_from.startswith("gpt2"):
     # init from a given GPT-2 model
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))

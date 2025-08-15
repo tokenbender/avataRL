@@ -51,43 +51,56 @@ config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 
 def load_critic_model(checkpoint_path: str):
     """
-    Load a pre-trained critic model from checkpoint.
+    Load a pre-trained critic model from checkpoint, optionally with 4-bit quantization.
     
     Args:
         checkpoint_path: Path to the critic model checkpoint
         
     Returns:
-        critic_model: Loaded critic model in eval mode on CUDA
+        critic_model: Loaded critic model in eval mode on CUDA (4-bit or FP16 based on config)
     """
-    print(f"Loading critic model from {checkpoint_path}")
-    
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cuda')
-    checkpoint_model_args = checkpoint["model_args"]
-    
-    # Create model with checkpoint config
-    gptconf = GPTConfig(**checkpoint_model_args)
-    critic_model = GPT(gptconf)
-    
-    # Load state dict
-    state_dict = checkpoint["model"]
-    # Remove unwanted prefix if present
-    unwanted_prefix = "_orig_mod."
-    for k, v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    
-    critic_model.load_state_dict(state_dict)
-    critic_model.cuda()
-    critic_model.eval()  # Set to eval mode
-    
-    # Disable gradients for critic
-    for param in critic_model.parameters():
-        param.requires_grad = False
-    
-    print(f"Teacher model loaded successfully - {checkpoint_model_args['n_layer']} layers, {checkpoint_model_args['n_embd']} dim")
-    
-    return critic_model
+    # Check if we should use 4-bit quantization (from config)
+    if use_4bit_critic:
+        # Import our 4-bit loading function
+        from load_critic_4bit import load_critic_model_4bit
+        
+        print(f"Loading critic with 4-bit quantization for ~75% memory reduction")
+        return load_critic_model_4bit(checkpoint_path)
+    else:
+        # Original FP16 loading path
+        print(f"Loading critic model in FP16 from {checkpoint_path}")
+        
+        # Load checkpoint - extract only what we need
+        checkpoint = torch.load(checkpoint_path, map_location='cuda')
+        checkpoint_model_args = checkpoint["model_args"]
+        state_dict = checkpoint["model"]
+        
+        # Free the checkpoint dict immediately - we don't need optimizer states!
+        del checkpoint
+        torch.cuda.empty_cache()
+        
+        # Create model with checkpoint config
+        gptconf = GPTConfig(**checkpoint_model_args)
+        critic_model = GPT(gptconf)
+        
+        # Remove unwanted prefix if present
+        unwanted_prefix = "_orig_mod."
+        for k, v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        
+        critic_model.load_state_dict(state_dict)
+        critic_model.cuda()
+        critic_model.eval()  # Set to eval mode
+        
+        # Disable gradients for critic
+        for param in critic_model.parameters():
+            param.requires_grad = False
+        
+        print(f"Critic loaded in FP16 - {checkpoint_model_args['n_layer']} layers, {checkpoint_model_args['n_embd']} dim")
+        print(f"Memory usage: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+        
+        return critic_model
 
 
 def compute_avatarl_loss(

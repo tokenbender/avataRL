@@ -77,6 +77,7 @@ bench = False  # Whether we're benchmarking - calculates MFU on each iteration
 # AvataRL specific parameters
 # -----------------------------------------------------------------------------
 critic_model_path = 'out/ckpt_wandb_logging_fix.pt' # Path to the pre-trained critic model
+use_4bit_critic = True  # Whether to load critic model with 4-bit quantization (saves ~75% memory)
 
 # PoE weights
 reality_weight = 0.7
