@@ -93,8 +93,3 @@ top_k = 16  # Top-k tokens from both student and teacher
 
 # Policy gradient
 entropy_coefficient = 0.01  # 1% creativity bonus
-
-# Centralized critic optimization
-use_centralized_critic = True  # Only load critic on rank 0, broadcast to others
-critic_prefetch_depth = 1  # Number of batches to prefetch (double buffering)
-critic_comm_backend = "nccl"  # Communication backend for critic operations

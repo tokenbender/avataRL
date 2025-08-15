@@ -582,79 +582,6 @@ def get_batch(split):
     return x, y
 
 
-@torch.no_grad()
-def get_critic_logits_pipelined(X_batch, Y_batch, critic_model, async_mode=True):
-    """
-    Centralized critic inference with pipelining.
-    Master gathers batches from all ranks, runs critic, broadcasts results.
-    Each rank gets back its appropriate portion of critic logits.
-    """
-    if not ddp or not use_centralized_critic:
-        # Single GPU mode or centralized critic disabled - direct inference
-        if critic_model is not None:
-            critic_logits, _ = critic_model(X_batch, Y_batch)
-            return critic_logits
-        else:
-            # This is a critical error - we need critic logits for AvataRL training
-            raise RuntimeError(
-                "Critic model is None but centralized critic is disabled. "
-                "This should not happen - either enable centralized critic or ensure "
-                "critic model is loaded. Check critic_model_path in config."
-            )
-    
-    # DDP mode with centralized critic
-    vocab_size = 50304  # GPT-2 vocab size
-    batch_size_local = X_batch.shape[0]
-    seq_len = X_batch.shape[1]
-    
-    if master_process:
-        # Master: Gather batches from all ranks and run critic
-        if critic_model is None:
-            raise RuntimeError(
-                f"Master process (rank {ddp_rank}) has no critic model loaded but "
-                f"centralized critic is enabled. Check critic loading logic."
-            )
-        
-        # Gather X batches from all ranks
-        gather_list_X = [torch.zeros_like(X_batch) for _ in range(ddp_world_size)]
-        dist.all_gather(gather_list_X, X_batch)
-        
-        # Gather Y batches from all ranks  
-        gather_list_Y = [torch.zeros_like(Y_batch) for _ in range(ddp_world_size)]
-        dist.all_gather(gather_list_Y, Y_batch)
-        
-        # Combine all batches
-        X_all = torch.cat(gather_list_X, dim=0)
-        Y_all = torch.cat(gather_list_Y, dim=0)
-        
-        # Run critic inference on combined batch
-        with ctx:
-            critic_logits_all, _ = critic_model(X_all, Y_all)
-    else:
-        # Workers: Participate in all_gather but don't run critic
-        gather_list_X = [torch.zeros_like(X_batch) for _ in range(ddp_world_size)]
-        dist.all_gather(gather_list_X, X_batch)
-        
-        gather_list_Y = [torch.zeros_like(Y_batch) for _ in range(ddp_world_size)]
-        dist.all_gather(gather_list_Y, Y_batch)
-        
-        # Prepare empty tensor for receiving broadcast
-        critic_logits_all = torch.zeros(
-            (batch_size_local * ddp_world_size, seq_len, vocab_size),
-            dtype=ptdtype, device=device
-        )
-    
-    # Broadcast critic logits from master to all workers
-    dist.broadcast(critic_logits_all, src=0)
-    
-    # Each rank extracts its portion
-    start_idx = ddp_rank * batch_size_local
-    end_idx = (ddp_rank + 1) * batch_size_local
-    critic_logits_local = critic_logits_all[start_idx:end_idx]
-    
-    return critic_logits_local
-
-
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
@@ -732,19 +659,9 @@ if block_size < model.config.block_size:
     )
 model.to(device)
 
-# Load critic model - conditional based on centralized critic setting
-critic_model = None
-if use_centralized_critic and ddp:
-    # Centralized mode: only master loads critic
-    if master_process:
-        critic_model = load_critic_model(critic_model_path)
-        print(f"Teacher model loaded from {critic_model_path} on rank 0 (centralized mode)")
-    else:
-        print(f"Rank {ddp_rank}: Using centralized critic from rank 0")
-else:
-    # Traditional mode: all ranks load critic
-    critic_model = load_critic_model(critic_model_path)
-    print(f"Teacher model loaded from {critic_model_path} (all ranks)")
+# Load critic model for AvataRL
+critic_model = load_critic_model(critic_model_path)
+print(f"Teacher model loaded from {critic_model_path}")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.amp.GradScaler("cuda", enabled=(dtype == "float16"))
@@ -848,12 +765,8 @@ def estimate_loss():
             with ctx:
                 student_logits, _ = model(X, Y)
                 
-                # Get critic logits via centralized pipeline
                 with torch.no_grad():
-                    if use_centralized_critic and ddp:
-                        critic_logits = get_critic_logits_pipelined(X, Y, critic_model, async_mode=False)
-                    else:
-                        critic_logits, _ = critic_model(X, Y) if critic_model else (None, None)
+                    critic_logits, _ = critic_model(X, Y)
                 
                 loss, _ = compute_avatarl_loss(
                     student_logits, critic_logits, Y,
@@ -939,25 +852,8 @@ profiler = (
 if speedrun and master_process:
     print("Speedrun mode enabled! 🏎️ 🏍️ 🐎 🏃‍♀️")
 
-# Initialize double buffering for centralized critic
-critic_logits_current = None
-critic_logits_next = None
-X_next, Y_next = None, None
-
-if use_centralized_critic and ddp:
-    print(f"Rank {ddp_rank}: Initializing centralized critic pipeline with double buffering")
-    # Pre-allocate communication buffers for efficiency
-    vocab_size = 50304
-    if master_process:
-        print(f"Master rank 0: Will gather batches from {ddp_world_size} ranks and run critic")
-
 # training loop
 X, Y = get_batch("train")  # fetch the very first batch
-
-# Prefetch first batch's critic logits if using centralized critic
-if use_centralized_critic and ddp:
-    critic_logits_current = get_critic_logits_pipelined(X, Y, critic_model, async_mode=False)
-    print(f"Rank {ddp_rank}: Prefetched first batch critic logits")
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
@@ -1069,14 +965,8 @@ with profiler:
                 student_logits, _ = model(X, Y)
                 
                 # Get critic logits for AvataRL
-                # Use prefetched critic logits if available (double buffering)
                 with torch.no_grad():
-                    if use_centralized_critic and ddp:
-                        # Use the prefetched critic logits
-                        critic_logits = critic_logits_current
-                    else:
-                        # Fallback to direct inference
-                        critic_logits, _ = critic_model(X, Y) if critic_model else (None, None)
+                    critic_logits, _ = critic_model(X, Y)
                 
                 # Compute AvataRL loss
                 loss, avatarl_metrics = compute_avatarl_loss(
@@ -1100,11 +990,6 @@ with profiler:
                 )  # scale the loss to account for gradient accumulation
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y = get_batch("train")
-            
-            # Prefetch critic logits for next iteration (double buffering)
-            if use_centralized_critic and ddp:
-                critic_logits_current = get_critic_logits_pipelined(X, Y, critic_model, async_mode=False)
-            
             # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()
 
@@ -1179,11 +1064,4 @@ with profiler:
             break
 
 if ddp:
-    # Clean up communication buffers
-    if use_centralized_critic:
-        del critic_logits_current
-        del critic_logits_next
-        torch.cuda.empty_cache()
-        if master_process:
-            print("Centralized critic buffers cleaned up")
     destroy_process_group()
