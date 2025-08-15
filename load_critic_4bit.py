@@ -53,16 +53,23 @@ def load_critic_model_4bit(checkpoint_path: str):
     """
     print(f"Loading critic model from {checkpoint_path}")
     
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    # Load only what we need - not the entire checkpoint!
+    # This avoids loading optimizer states which can be HUGE
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    
+    # Extract only what we need and free the rest immediately
     checkpoint_model_args = checkpoint["model_args"]
+    state_dict = checkpoint["model"]
+    
+    # Free the checkpoint dict immediately - we don't need optimizer states!
+    del checkpoint
+    torch.cuda.empty_cache()  # Free any GPU memory if applicable
     
     # Create model with checkpoint config
     gptconf = GPTConfig(**checkpoint_model_args)
     critic_model = GPT(gptconf)
     
-    # Load state dict FIRST (important for correct weight shapes)
-    state_dict = checkpoint["model"]
+    # Clean state dict keys if needed
     unwanted_prefix = "_orig_mod."
     for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):

@@ -78,16 +78,21 @@ def load_model(checkpoint_path):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
     
-    # Load checkpoint
+    # Load checkpoint - but only what we need!
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Extract only what we need for inference
     checkpoint_model_args = checkpoint["model_args"]
+    state_dict = checkpoint["model"]
+    
+    # Free the checkpoint dict immediately - we don't need optimizer states!
+    del checkpoint
+    if device == 'cuda':
+        torch.cuda.empty_cache()
     
     # Create model with checkpoint config
     gptconf = GPTConfig(**checkpoint_model_args)
     model = GPT(gptconf)
-    
-    # Load state dict
-    state_dict = checkpoint["model"]
     # Remove unwanted prefix if present
     unwanted_prefix = "_orig_mod."
     for k, v in list(state_dict.items()):
