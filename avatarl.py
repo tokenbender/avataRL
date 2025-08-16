@@ -112,7 +112,8 @@ def compute_avatarl_loss(
     label_smoothing_epsilon: float = 0.1,
     reward_scale: float = 100.0,
     top_k: int = 16,
-    entropy_coefficient: float = 0.01
+    entropy_coefficient: float = 0.01,
+    max_reward_clamp: float = None
 ) -> Tensor:
     """
     Compute the AvataRL policy gradient loss with active token label smoothing.
@@ -139,6 +140,7 @@ def compute_avatarl_loss(
         reward_scale: Scale factor for rewards (default: 100.0)
         top_k: Number of top tokens to consider from both student and critic (default: 16)
         entropy_coefficient: Coefficient for entropy regularization (default: 0.01)
+        max_reward_clamp: Maximum reward value to prevent gradient explosion (default: None, uses global config)
         
     Returns:
         tuple: (loss, metrics_dict)
@@ -174,7 +176,7 @@ def compute_avatarl_loss(
     # FULLY VECTORIZED: Remove duplicates while keeping first occurrence
     # No python loops - pure GPU tensor operations
     batch_size_seq = combined_indices.size(0)
-    max_actions = 33
+    max_actions = 2 * top_k + 1  # Dynamic calculation based on top_k
     
     # Sort each row and find unique consecutive values
     sorted_indices, sort_idx = combined_indices.sort(dim=1)
@@ -284,9 +286,10 @@ def compute_avatarl_loss(
     # Apply mask to ensure padded positions stay zero
     action_rewards = action_rewards * action_masks.float()
     
-    # CRITICAL: Clamp rewards to max 1.5 and rescale others proportionally
+    # CRITICAL: Clamp rewards to max value and rescale others proportionally
     # This prevents gradient explosion while maintaining relative reward differences
-    max_reward_clamp = 1.5
+    if max_reward_clamp is None:
+        max_reward_clamp = globals().get('max_reward_clamp', 1.5)  # Use config value or default
     max_reward_per_seq = action_rewards.max(dim=1, keepdim=True)[0]
     
     # Only rescale if any reward exceeds the clamp threshold
@@ -781,7 +784,7 @@ if ddp:
     model = DDP(
         model,
         device_ids=[ddp_local_rank],
-        bucket_cap_mb=512,
+        bucket_cap_mb=ddp_bucket_cap_mb,
     )
 
 
@@ -811,7 +814,8 @@ def estimate_loss():
                     label_smoothing_epsilon=label_smoothing_epsilon,
                     reward_scale=reward_scale,
                     top_k=top_k,
-                    entropy_coefficient=entropy_coefficient
+                    entropy_coefficient=entropy_coefficient,
+                    max_reward_clamp=max_reward_clamp
                 )
                 losses[k] = loss.item()
 
@@ -914,10 +918,10 @@ with profiler:
                 param_group["lr"] = param_group["initial_lr"] * (lr / learning_rate)
         
         # Muon momentum warmup (only for dual optimizer mode)
-        if use_dual_optimizer and iter_num < 300:
+        if use_dual_optimizer and iter_num < muon_warmup_iters:
             for group in optimizer2.param_groups:
-                frac = min(iter_num / 300, 1)
-                group["momentum"] = (1 - frac) * 0.85 + frac * 0.95  # 0.85 -> 0.95
+                frac = min(iter_num / muon_warmup_iters, 1)
+                group["momentum"] = (1 - frac) * muon_warmup_start_momentum + frac * muon_warmup_end_momentum
 
         # evaluate the loss on train/val sets and write checkpoints
         if iter_num % eval_interval == 0 and iter_num > 0 and master_process:
@@ -1012,7 +1016,8 @@ with profiler:
                     label_smoothing_epsilon=label_smoothing_epsilon,
                     reward_scale=reward_scale,
                     top_k=top_k,
-                    entropy_coefficient=entropy_coefficient
+                    entropy_coefficient=entropy_coefficient,
+                    max_reward_clamp=max_reward_clamp
                 )
                 
                 # Calculate top-1 cross-entropy loss for logging
@@ -1058,8 +1063,7 @@ with profiler:
             
             # Update running averages for AvataRL metrics
             if 'avatarl_metrics' in locals():
-                alpha = 0.1  # smoothing factor
-                running_avg_reward = (1 - alpha) * running_avg_reward + alpha * avatarl_metrics['avg_reward']
+                running_avg_reward = (1 - running_avg_alpha) * running_avg_reward + running_avg_alpha * avatarl_metrics['avg_reward']
                 out_str += f", reward {running_avg_reward:.3f}"
 
             if local_iter_num >= 5:

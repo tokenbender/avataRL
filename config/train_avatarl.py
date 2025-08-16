@@ -94,3 +94,17 @@ top_k = 4  # Top-k tokens from both student and teacher
 
 # Policy gradient
 entropy_coefficient = 0.01  # 1% creativity bonus
+
+# Training stability
+max_reward_clamp = 1.5  # Clamp rewards to prevent gradient explosion
+
+# Muon optimizer warmup
+muon_warmup_iters = 300  # Number of iterations for Muon momentum warmup
+muon_warmup_start_momentum = 0.85  # Starting momentum for warmup
+muon_warmup_end_momentum = 0.95  # Final momentum after warmup
+
+# Logging
+running_avg_alpha = 0.1  # Smoothing factor for running averages
+
+# DDP settings  
+ddp_bucket_cap_mb = 512  # DDP gradient bucketing size in MB
