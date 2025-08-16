@@ -6,7 +6,7 @@
 set -e  # Exit on error
 
 echo "=== Timed AvataRL Training Script ==="
-echo "Configuration: 8 GPUs, 600 iterations"
+echo "Configuration: 8 GPUs"
 echo
 
 # Record start time
@@ -17,7 +17,7 @@ echo "Training Start Time: $start_time_readable"
 echo "Timestamp: $start_time"
 echo "----------------------------------------"
 
-# Run AvataRL training with 8 GPUs and 600 iterations
+# Run AvataRL training with 8 GPUs
 # Using torchrun for distributed training across 8 GPUs
 torchrun --standalone --nproc_per_node=8 avatarl.py
 
