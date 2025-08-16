@@ -217,52 +217,64 @@ def compute_avatarl_loss(
     action_masks[row_indices, positions] = True
     
     # --- Step 2: Construct the Ideal Reward Distribution (PoE Model) ---
-    # Get mentor (critic) probabilities
-    mentor_probs = torch.nn.functional.softmax(critic_logits_flat, dim=-1)
+    # OPTIMIZED: Gather logits for action space FIRST, then compute softmax only over ~32 tokens
+    # This avoids wasting compute on 50,304 tokens when we only need ~32
     
-    # FULLY VECTORIZED: Create reality expert distribution with ACTIVE TOKEN label smoothing
-    # All operations stay on GPU - no loops, no CPU synchronization
-    reality_probs = torch.zeros_like(mentor_probs)
+    # Gather critic logits for action space tokens only
+    critic_logits_for_actions = critic_logits_flat.gather(1, action_indices_padded)
     
-    # Set ground truth probabilities for all positions in one operation
-    batch_indices = torch.arange(batch_size_seq, device=reality_probs.device)
-    reality_probs[batch_indices, ground_truth_flat] = 1.0 - label_smoothing_epsilon
+    # Mask invalid positions with -inf before softmax
+    masked_critic_logits = torch.where(
+        action_masks,
+        critic_logits_for_actions,
+        torch.tensor(-1e10, device=critic_logits_for_actions.device)
+    )
     
-    # VECTORIZED label smoothing distribution across active tokens
-    # Count number of active tokens per sequence (for computing smoothing mass)
+    # Compute softmax ONLY over the ~32 action space tokens (1,572x faster than full vocab!)
+    mentor_probs_actions = torch.nn.functional.softmax(masked_critic_logits, dim=-1)
+    
+    # Create reality expert distribution over action space only
+    reality_probs_actions = torch.zeros_like(mentor_probs_actions)
+    
+    # Find which position in action_indices corresponds to ground truth
+    # We need to find where ground_truth_flat appears in action_indices_padded
+    gt_expanded = ground_truth_flat.unsqueeze(1).expand_as(action_indices_padded)
+    gt_mask = (action_indices_padded == gt_expanded) & action_masks
+    
+    # Set ground truth probabilities (will be exactly one True per row)
+    reality_probs_actions[gt_mask] = 1.0 - label_smoothing_epsilon
+    
+    # Distribute label smoothing mass across active tokens
     num_active_per_seq = action_masks.sum(dim=1, keepdim=True).float()
     
     # Compute smoothing per token (epsilon divided by number of non-GT active tokens)
-    # Handle edge case where only GT is active (num_active = 1)
     smoothing_per_token = torch.where(
         num_active_per_seq > 1,
         label_smoothing_epsilon / (num_active_per_seq - 1),
         torch.zeros_like(num_active_per_seq)
     )
     
-    # Scatter smoothing mass to all active tokens using advanced indexing
-    # Get indices of all active tokens
-    active_rows, active_cols = action_masks.nonzero(as_tuple=True)
-    active_token_ids = action_indices_padded[active_rows, active_cols]
-    
-    # Scatter add the smoothing values
-    reality_probs[active_rows, active_token_ids] += smoothing_per_token[active_rows, 0]
-    
-    # Restore ground truth probability (overwrites any smoothing on GT token)
-    reality_probs[batch_indices, ground_truth_flat] = torch.where(
-        num_active_per_seq.squeeze() > 0,
-        1.0 - label_smoothing_epsilon,
-        1.0  # If no active tokens, GT gets full probability
+    # Add smoothing to all active tokens
+    reality_probs_actions = torch.where(
+        action_masks,
+        reality_probs_actions + smoothing_per_token,
+        reality_probs_actions
     )
     
-    # Combine experts using weighted geometric mean
-    # P_ideal ∝ P_reality^0.7 * P_mentor^0.3
-    ideal_probs = torch.pow(reality_probs, reality_weight) * torch.pow(mentor_probs, mentor_weight)
+    # Restore ground truth probability (overwrites any smoothing on GT token)
+    reality_probs_actions[gt_mask] = torch.where(
+        num_active_per_seq[gt_mask.any(dim=1, keepdim=True)].squeeze() > 0,
+        1.0 - label_smoothing_epsilon,
+        1.0
+    )
     
-    # --- Step 3: Generate Positive Rewards ---
-    # Extract raw probabilities for action space tokens only
-    # Using our already-computed action_indices_padded and action_masks from above
-    action_probs_raw = ideal_probs.gather(1, action_indices_padded)
+    # Apply mask to ensure padded positions stay zero
+    reality_probs_actions = reality_probs_actions * action_masks.float()
+    mentor_probs_actions = mentor_probs_actions * action_masks.float()
+    
+    # Combine experts using weighted geometric mean (now only over ~32 tokens!)
+    # P_ideal ∝ P_reality^0.7 * P_mentor^0.3
+    action_probs_raw = torch.pow(reality_probs_actions, reality_weight) * torch.pow(mentor_probs_actions, mentor_weight)
     
     # Normalize ONLY over action space (not entire vocabulary!)
     # This concentrates 100% probability mass on our ~32 tokens
