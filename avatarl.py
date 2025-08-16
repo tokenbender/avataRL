@@ -171,77 +171,96 @@ def compute_avatarl_loss(
         ground_truth_flat.unsqueeze(1)
     ], dim=1)
     
-    # VECTORIZED: Remove duplicates while preserving order (keep first occurrence)
-    # This ensures ground truth is always included even if it appears in top-k
-    # Use vectorized operations to avoid GPU-CPU synchronization
+    # FULLY VECTORIZED: Remove duplicates while keeping first occurrence
+    # No python loops - pure GPU tensor operations
     batch_size_seq = combined_indices.size(0)
     max_actions = 33
     
-    # Create a mask for unique values using broadcasting
-    # For each position, mark first occurrence of each value
-    expanded_indices = combined_indices.unsqueeze(2)  # [batch*seq, 33, 1]
-    compared = expanded_indices == expanded_indices.transpose(1, 2)  # [batch*seq, 33, 33]
-    # Lower triangular mask to keep only first occurrences
-    first_occurrence_mask = torch.tril(compared).sum(dim=2) == 1  # [batch*seq, 33]
+    # Sort each row and find unique consecutive values
+    sorted_indices, sort_idx = combined_indices.sort(dim=1)
     
-    # Apply mask and limit to max_actions
-    action_space_indices = []
-    for i in range(batch_size_seq):
-        masked = combined_indices[i][first_occurrence_mask[i]]
-        if masked.size(0) > max_actions:
-            masked = masked[:max_actions]
-        action_space_indices.append(masked.tolist())
+    # Create mask for unique values (mark first occurrence of each unique value)
+    unique_mask = torch.cat([
+        torch.ones(batch_size_seq, 1, dtype=torch.bool, device=sorted_indices.device),
+        sorted_indices[:, 1:] != sorted_indices[:, :-1]
+    ], dim=1)
+    
+    # To preserve original order, we need to map back using sort indices
+    # Create a scatter mask that marks positions of unique values in original order
+    unsort_idx = sort_idx.argsort(dim=1)
+    original_unique_mask = unique_mask.gather(1, unsort_idx)
+    
+    # Now we have a mask in original order - create padded tensor with all unique indices
+    # Use cumsum to create position indices for scatter
+    num_unique_per_row = original_unique_mask.sum(dim=1, keepdim=True)
+    max_unique = min(max_actions, num_unique_per_row.max().item())
+    
+    # Create output tensor and position indices
+    action_indices_padded = torch.zeros(batch_size_seq, max_unique, dtype=torch.long, device=combined_indices.device)
+    action_masks = torch.zeros(batch_size_seq, max_unique, dtype=torch.bool, device=combined_indices.device)
+    
+    # FULLY VECTORIZED scatter using advanced indexing
+    # Compute positions for scatter
+    position_indices = original_unique_mask.cumsum(dim=1) - 1
+    
+    # Only scatter where we have unique values
+    valid_positions = original_unique_mask & (position_indices < max_unique)
+    
+    # Get row and column indices for valid positions
+    row_indices, col_indices = valid_positions.nonzero(as_tuple=True)
+    positions = position_indices[row_indices, col_indices]
+    
+    # Scatter unique values to their positions in the output tensor
+    action_indices_padded[row_indices, positions] = combined_indices[row_indices, col_indices]
+    action_masks[row_indices, positions] = True
     
     # --- Step 2: Construct the Ideal Reward Distribution (PoE Model) ---
     # Get mentor (critic) probabilities
     mentor_probs = torch.nn.functional.softmax(critic_logits_flat, dim=-1)
     
-    # VECTORIZED: Create reality expert distribution with ACTIVE TOKEN label smoothing
-    # Instead of spreading epsilon across all vocab_size tokens, concentrate it on active tokens only
+    # FULLY VECTORIZED: Create reality expert distribution with ACTIVE TOKEN label smoothing
+    # All operations stay on GPU - no loops, no CPU synchronization
     reality_probs = torch.zeros_like(mentor_probs)
     
-    # Batch process all positions at once to avoid Python loops
-    # First, set ground truth probabilities for all positions
+    # Set ground truth probabilities for all positions in one operation
     batch_indices = torch.arange(batch_size_seq, device=reality_probs.device)
     reality_probs[batch_indices, ground_truth_flat] = 1.0 - label_smoothing_epsilon
     
-    # Process each position's active tokens (still need loop but optimized)
-    for i, active_indices in enumerate(action_space_indices):
-        if len(active_indices) > 1:
-            active_indices_tensor = torch.tensor(active_indices, device=reality_probs.device, dtype=torch.long)
-            num_active = len(active_indices)
-            
-            # Distribute epsilon mass uniformly among non-ground-truth active tokens
-            smoothing_per_token = label_smoothing_epsilon / (num_active - 1)
-            
-            # Set smoothing for all active tokens first
-            reality_probs[i, active_indices_tensor] = smoothing_per_token
-            
-            # Restore ground truth probability (overwrites the smoothing for GT token)
-            reality_probs[i, ground_truth_flat[i]] = 1.0 - label_smoothing_epsilon
-        elif len(active_indices) == 1:
-            # Edge case: only ground truth is active
-            reality_probs[i, ground_truth_flat[i]] = 1.0
+    # VECTORIZED label smoothing distribution across active tokens
+    # Count number of active tokens per sequence (for computing smoothing mass)
+    num_active_per_seq = action_masks.sum(dim=1, keepdim=True).float()
+    
+    # Compute smoothing per token (epsilon divided by number of non-GT active tokens)
+    # Handle edge case where only GT is active (num_active = 1)
+    smoothing_per_token = torch.where(
+        num_active_per_seq > 1,
+        label_smoothing_epsilon / (num_active_per_seq - 1),
+        torch.zeros_like(num_active_per_seq)
+    )
+    
+    # Scatter smoothing mass to all active tokens using advanced indexing
+    # Get indices of all active tokens
+    active_rows, active_cols = action_masks.nonzero(as_tuple=True)
+    active_token_ids = action_indices_padded[active_rows, active_cols]
+    
+    # Scatter add the smoothing values
+    reality_probs[active_rows, active_token_ids] += smoothing_per_token[active_rows, 0]
+    
+    # Restore ground truth probability (overwrites any smoothing on GT token)
+    reality_probs[batch_indices, ground_truth_flat] = torch.where(
+        num_active_per_seq.squeeze() > 0,
+        1.0 - label_smoothing_epsilon,
+        1.0  # If no active tokens, GT gets full probability
+    )
     
     # Combine experts using weighted geometric mean
     # P_ideal ∝ P_reality^0.7 * P_mentor^0.3
     ideal_probs = torch.pow(reality_probs, reality_weight) * torch.pow(mentor_probs, mentor_weight)
     
-    # CRITICAL FIX: Don't normalize over full vocabulary here!
-    # We'll normalize only over action space tokens below
-    
-    # Pad sequences to same length for batch processing
-    max_actions = max(len(seq) for seq in action_space_indices)
-    padded_indices = torch.zeros((len(action_space_indices), max_actions), dtype=torch.long, device=student_logits.device)
-    action_masks = torch.zeros((len(action_space_indices), max_actions), dtype=torch.bool, device=student_logits.device)
-    
-    for i, indices in enumerate(action_space_indices):
-        padded_indices[i, :len(indices)] = torch.tensor(indices, device=student_logits.device)
-        action_masks[i, :len(indices)] = True
-    
     # --- Step 3: Generate Positive Rewards ---
     # Extract raw probabilities for action space tokens only
-    action_probs_raw = ideal_probs.gather(1, padded_indices)
+    # Using our already-computed action_indices_padded and action_masks from above
+    action_probs_raw = ideal_probs.gather(1, action_indices_padded)
     
     # Normalize ONLY over action space (not entire vocabulary!)
     # This concentrates 100% probability mass on our ~32 tokens
@@ -282,12 +301,23 @@ def compute_avatarl_loss(
     action_rewards = action_rewards * rescale_factor
     
     # --- Step 4: Calculate Policy Gradient Loss ---
-    # OPTIMIZED: Compute softmax once and derive log_softmax from it
-    student_probs = torch.nn.functional.softmax(student_logits_flat, dim=-1)
-    student_log_probs = torch.log(student_probs + 1e-10)  # Add small epsilon for numerical stability
+    # OPTIMIZED: Gather logits first, then compute softmax only over action space
+    # This reduces computation from O(batch*seq*vocab) to O(batch*seq*max_actions)
+    student_logits_for_actions = student_logits_flat.gather(1, action_indices_padded)
     
-    # Get student's log probabilities for the action space
-    student_log_probs_for_actions = student_log_probs.gather(1, padded_indices)
+    # Apply temperature scaling for exploration (replaces entropy regularization)
+    # Higher temperature = more exploration, lower temperature = more exploitation
+    temperature = 1.0 + entropy_coefficient  # Use entropy_coefficient to control exploration
+    student_logits_for_actions_scaled = student_logits_for_actions / temperature
+    
+    # Compute log_softmax only over the action space tokens
+    # Mask invalid positions with -inf before softmax
+    masked_student_logits = torch.where(
+        action_masks,
+        student_logits_for_actions_scaled,
+        torch.tensor(-1e10, device=student_logits_for_actions_scaled.device)
+    )
+    student_log_probs_for_actions = torch.nn.functional.log_softmax(masked_student_logits, dim=-1)
     
     # Apply mask to log probs
     student_log_probs_for_actions = student_log_probs_for_actions * action_masks.float()
@@ -300,16 +330,9 @@ def compute_avatarl_loss(
     num_valid_actions = action_masks.sum(dim=1).float()
     policy_gradient_loss = policy_gradient_loss / (num_valid_actions + 1e-8)
     
-    # --- Step 5: Add Entropy Regularization ---
-    # Calculate entropy of student's full distribution (reuse cached probs and log_probs)
-    student_entropy = -(student_probs * student_log_probs).sum(dim=-1)
-    
-    # Entropy bonus (negative because we minimize loss)
-    entropy_bonus = entropy_coefficient * student_entropy
-    
-    # --- Step 6: Combine Losses ---
-    # Total loss = policy gradient loss - entropy bonus
-    total_loss = (policy_gradient_loss - entropy_bonus).mean()
+    # --- Step 5: Combine Losses ---
+    # Total loss = policy gradient loss (temperature scaling handles exploration)
+    total_loss = policy_gradient_loss.mean()
     
     # --- Compute Additional Metrics for Logging ---
     # Calculate average rewards (only for valid actions)
@@ -327,7 +350,7 @@ def compute_avatarl_loss(
         'max_reward': max_reward,
         'min_reward': min_reward,
         'avg_action_space_size': avg_action_space_size,
-        'avg_entropy': student_entropy.mean().item()
+        'temperature': temperature  # Report temperature instead of entropy
     }
 
 # -----------------------------------------------------------------------------
