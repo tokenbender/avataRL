@@ -304,25 +304,19 @@ def compute_avatarl_loss(
     action_rewards = action_rewards * rescale_factor
     
     # --- Step 4: Calculate Policy Gradient Loss ---
-    # OPTIMIZED: Gather logits first, then compute softmax only over action space
-    # This reduces computation from O(batch*seq*vocab) to O(batch*seq*max_actions)
-    student_logits_for_actions = student_logits_flat.gather(1, action_indices_padded)
-    
     # Apply temperature scaling for exploration (replaces entropy regularization)
     # Higher temperature = more exploration, lower temperature = more exploitation
     temperature = 1.0 + entropy_coefficient  # Use entropy_coefficient to control exploration
-    student_logits_for_actions_scaled = student_logits_for_actions / temperature
     
-    # Compute log_softmax only over the action space tokens
-    # Mask invalid positions with -inf before softmax
-    masked_student_logits = torch.where(
-        action_masks,
-        student_logits_for_actions_scaled,
-        torch.tensor(-1e10, device=student_logits_for_actions_scaled.device)
+    # full-vocab log-probs (B*T, V). this reintroduces the partition term so *all* logits get gradient.
+    student_log_probs_full = torch.nn.functional.log_softmax(
+        student_logits_flat / temperature, dim=-1
     )
-    student_log_probs_for_actions = torch.nn.functional.log_softmax(masked_student_logits, dim=-1)
-    
-    # Apply mask to log probs
+
+    # gather only the action tokens' log-probs for the policy gradient (B*T, max_actions)
+    student_log_probs_for_actions = student_log_probs_full.gather(1, action_indices_padded)
+
+    # mask out padding in the action set
     student_log_probs_for_actions = student_log_probs_for_actions * action_masks.float()
     
     # Policy gradient loss: -sum(log_policy * reward)
