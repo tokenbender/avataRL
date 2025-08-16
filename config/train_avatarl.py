@@ -10,7 +10,7 @@ experiment_name = "avatarl_pretrain_250M_adamw_big_critic"
 
 # Evaluation and logging intervals
 # Can specify as iterations (int) or epochs (float with 'e' suffix in string, e.g., "0.5e" for every half epoch)
-eval_interval = 50  # Evaluate every N iterations (or set to "1.0e" for every epoch)
+eval_interval = 200  # Evaluate every N iterations (or set to "1.0e" for every epoch)
 log_interval = 10  # Log every N iterations
 eval_iters = 80
 eval_only = False
@@ -41,7 +41,7 @@ learning_rate = 6e-4  # Adjusted for better stability with AvataRL
 
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
-max_iters = 60  # Maximum training iterations (set to None to use max_epochs instead)
+max_iters = 201  # Maximum training iterations (set to None to use max_epochs instead)
 max_epochs = None  # Maximum training epochs (set to None to use max_iters instead)
 weight_decay = 1e-1
 beta1 = 0.9
