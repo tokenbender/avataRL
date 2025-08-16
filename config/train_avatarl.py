@@ -65,6 +65,33 @@ min_lr = 6e-5  # ~1/10 of learning_rate per Chinchilla
 # DDP settings
 backend = "nccl"
 
+# -----------------------------------------------------------------------------
+# DataLoader optimization settings
+# -----------------------------------------------------------------------------
+# Number of worker processes for data loading per GPU
+# - If CPU count >> GPU count: use 8-16 workers per GPU
+# - If CPU constrained: use 2-4 workers per GPU  
+# - If debugging: set to 0 for synchronous loading
+# - Higher values improve GPU utilization via CPU-GPU overlap
+num_dataloader_workers = 10
+
+# Number of batches each worker prefetches
+# - If memory abundant: use 2-4 for smooth batch availability
+# - If memory constrained: use 1 or None
+# - Creates buffer of ready batches to prevent GPU stalls
+prefetch_factor = 2
+
+# Keep workers alive between epochs
+# - If using many workers: set True to avoid restart overhead
+# - If memory tight: set False to free memory between epochs
+persistent_workers = True
+
+# Pin memory for faster GPU transfer
+# - If using CUDA: set True for async GPU transfers
+# - If CPU memory limited: set False (small overhead per batch)
+# - Enables non_blocking=True for overlapped transfers
+pin_memory = True
+
 # system
 device = "cuda"
 dtype = "bfloat16"

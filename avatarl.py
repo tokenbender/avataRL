@@ -27,6 +27,7 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
+from data_loader import create_train_val_loaders, DataLoaderIterator
 
 from model import GPTConfig, GPT
 
@@ -585,34 +586,6 @@ class Muon(torch.optim.Optimizer):
             update_prev()
 
 # -----------------------------------------------------------------------------
-# poor man's data loader
-
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == "train":
-        data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
-    else:
-        data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack(
-        [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
-    )
-    y = torch.stack(
-        [
-            torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64))
-            for i in ix
-        ]
-    )
-    if device_type == "cuda":
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = (
-            x.pin_memory().to(device, non_blocking=True),
-            y.pin_memory().to(device, non_blocking=True),
-        )
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
 
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -885,6 +858,32 @@ profiler = (
 
 if speedrun and master_process:
     print("Speedrun mode enabled! 🏎️ 🏍️ 🐎 🏃‍♀️")
+
+# Initialize optimized DataLoaders
+if master_process:
+    print(f"Initializing DataLoaders with {num_dataloader_workers} workers for async prefetching")
+
+train_loader, val_loader = create_train_val_loaders(
+    data_dir=data_dir,
+    block_size=block_size,
+    batch_size=batch_size,
+    num_workers=num_dataloader_workers,
+    prefetch_factor=prefetch_factor,
+    persistent_workers=persistent_workers,
+    pin_memory=pin_memory,
+    seed=1337 + seed_offset
+)
+
+# Create iterators with device handling
+train_iterator = DataLoaderIterator(train_loader, device)
+val_iterator = DataLoaderIterator(val_loader, device)
+
+# Replace get_batch function with DataLoader-based version
+def get_batch(split):
+    if split == "train":
+        return train_iterator.get_batch()
+    else:
+        return val_iterator.get_batch()
 
 # training loop
 X, Y = get_batch("train")  # fetch the very first batch
