@@ -654,7 +654,7 @@ with profiler:
                 group["momentum"] = (1 - frac) * 0.85 + frac * 0.95  # 0.85 -> 0.95
 
         # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % eval_interval == 0 and master_process:
+        if iter_num % eval_interval == 0 and iter_num > 0 and master_process:
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - training_time_t0)

@@ -12,7 +12,7 @@ experiment_name = "avatarl_pretrain_250M_adamw_big_critic"
 # Can specify as iterations (int) or epochs (float with 'e' suffix in string, e.g., "0.5e" for every half epoch)
 eval_interval = 500  # Evaluate every N iterations (or set to "1.0e" for every epoch)
 log_interval = 10  # Log every N iterations
-eval_iters = 200
+eval_iters = 80
 eval_only = False
 always_save_checkpoint = True
 init_from = "scratch"
@@ -23,10 +23,10 @@ wandb_project = "nanogpt-avatarl"
 wandb_run_name = "run_" + str(time.time())
 
 # data
-dataset = "shakespeare"
+dataset = "openwebtext"
 gradient_accumulation_steps = 8  # Increased from 8 to better utilize GPU (will be divided by world_size)
 # Note: This will be divided by world_size in DDP, so effective steps per GPU = 4 with 8 GPUs
-batch_size = 8  # Increased from 4 to better utilize GPU memory (adjust down if OOM)
+batch_size = 16  # Increased from 4 to better utilize GPU memory (adjust down if OOM)
 block_size = 1024  # Keeping at 512 to balance memory usage with dual models
 
 # model - matching teacher model configuration from train.py
@@ -42,7 +42,7 @@ learning_rate = 6e-4  # Adjusted for better stability with AvataRL
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
 max_iters = None  # Maximum training iterations (set to None to use max_epochs instead)
-max_epochs = 1  # Maximum training epochs (set to None to use max_iters instead)
+max_epochs = 0.1  # Maximum training epochs (set to None to use max_iters instead)
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -90,7 +90,7 @@ label_smoothing_epsilon = 0.1  # 90% ground truth, 10% spread across action spac
 reward_scale = 100.0  # Scale probabilities to meaningful rewards
 
 # Action space
-top_k = 16  # Top-k tokens from both student and teacher
+top_k = 4  # Top-k tokens from both student and teacher
 
 # Policy gradient
 entropy_coefficient = 0.01  # 1% creativity bonus
