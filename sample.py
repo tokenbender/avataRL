@@ -13,9 +13,9 @@ init_from = (
     "resume"  # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 )
 out_dir = "out"  # ignored if init_from is not 'resume'
-experiment_name = "avatarl_pretrain_250M_adamw_big_critic_shakespeare"  # optional experiment name suffix for checkpoint files
+experiment_name = "avatarl_pretrain_250M_adamw_big_critic"  # optional experiment name suffix for checkpoint files
 use_4bit = False  # whether to load model with 4-bit quantization for memory efficiency
-start = "Romeo, Oh Romeo, where art thou?"  # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+start = "tell me a story about a guy who used to be a teacher but now he is a rug picker."  # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10  # number of samples to draw
 max_new_tokens = 500  # number of tokens generated in each sample
 temperature = (
@@ -24,6 +24,7 @@ temperature = (
 top_k = (
     16  # retain only the top_k most likely tokens, clamp others to have 0 probability
 )
+repetition_penalty = 1.1  # 1.0 = no penalty, > 1.0 = penalize repetition
 seed = 1337
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = (
@@ -119,6 +120,6 @@ x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, repetition_penalty=repetition_penalty)
             print(decode(y[0].tolist()))
             print("---------------")
