@@ -37,16 +37,21 @@ python3 -c "import torch; print(f'PyTorch {torch.__version__} installed')" || {
         tiktoken==0.9.0 \
         wandb==0.19.11 \
         tqdm==4.67.1 \
-        numpy==2.3.2
+        numpy==2.3.2 \
+        bitsandbytes==0.45.0
 }
 
-# Ensure numpy is available in virtual environment if using one
+# Ensure numpy and bitsandbytes are available in virtual environment if using one
 if [ -d ".venv" ]; then
-    echo "Virtual environment detected, ensuring numpy is installed..."
+    echo "Virtual environment detected, ensuring numpy and bitsandbytes are installed..."
     source .venv/bin/activate
     python -c "import numpy; print(f'NumPy {numpy.__version__} available')" || {
         echo "Installing numpy in virtual environment..."
         python -m pip install numpy==2.3.2
+    }
+    python -c "import bitsandbytes; print(f'bitsandbytes available')" || {
+        echo "Installing bitsandbytes in virtual environment..."
+        python -m pip install bitsandbytes==0.45.0
     }
 fi
 
