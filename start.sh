@@ -53,28 +53,28 @@ if [ ! -f "$DATA_DIR/train.bin" ] || [ ! -f "$DATA_DIR/val.bin" ]; then
     if command -v wget &> /dev/null; then
         echo "Downloading train.bin (604 kB)..."
         wget -q --show-progress -O "$DATA_DIR/train.bin" \
-            "https://huggingface.co/datasets/TokenBender/avataRL/resolve/main/train.bin" || {
+            "https://huggingface.co/datasets/TokenBender/avataRL_openwebtext/resolve/main/train.bin" || {
             echo "ERROR: Failed to download train.bin"
             exit 1
         }
         
         echo "Downloading val.bin (72.1 kB)..."
         wget -q --show-progress -O "$DATA_DIR/val.bin" \
-            "https://huggingface.co/datasets/TokenBender/avataRL/resolve/main/val.bin" || {
+            "https://huggingface.co/datasets/TokenBender/avataRL_openwebtext/resolve/main/val.bin" || {
             echo "ERROR: Failed to download val.bin"
             exit 1
         }
     elif command -v curl &> /dev/null; then
         echo "Downloading train.bin (604 kB)..."
         curl -L -o "$DATA_DIR/train.bin" \
-            "https://huggingface.co/datasets/TokenBender/avataRL/resolve/main/train.bin" || {
+            "https://huggingface.co/datasets/TokenBender/avataRL_openwebtext/resolve/main/train.bin" || {
             echo "ERROR: Failed to download train.bin"
             exit 1
         }
         
         echo "Downloading val.bin (72.1 kB)..."
         curl -L -o "$DATA_DIR/val.bin" \
-            "https://huggingface.co/datasets/TokenBender/avataRL/resolve/main/val.bin" || {
+            "https://huggingface.co/datasets/TokenBender/avataRL_openwebtext/resolve/main/val.bin" || {
             echo "ERROR: Failed to download val.bin"
             exit 1
         }
