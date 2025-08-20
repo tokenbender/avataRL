@@ -407,24 +407,25 @@ def get_dataset_size(split):
 try:
     if os.path.exists(os.path.join(data_dir, "train.bin")):
         train_tokens = get_dataset_size("train")
-        # Number of sequences we can sample from the dataset
-        num_sequences = train_tokens - block_size + 1
-        # Iterations per epoch = sequences / (batch_size * gradient_accumulation_steps * world_size)
-        iterations_per_epoch = num_sequences // (batch_size * gradient_accumulation_steps * ddp_world_size)
-        tokens_per_epoch = iterations_per_epoch * tokens_per_iter
-        
         print(f"dataset has {train_tokens:,} tokens")
+
+        # Define epoch by tokens: iterations_per_epoch = ceil(train_tokens / tokens_per_iter), min 1
+        iterations_per_epoch = max(1, math.ceil(train_tokens / tokens_per_iter))
+        tokens_per_epoch = iterations_per_epoch * tokens_per_iter
+
         print(f"iterations per epoch: {iterations_per_epoch:,}")
         print(f"tokens per epoch: {tokens_per_epoch:,}")
-        
+
         # Handle max_epochs vs max_iters configuration
         if 'max_epochs' in globals() and max_epochs is not None:
-            # Calculate max_iters from max_epochs
-            max_iters = int(max_epochs * iterations_per_epoch)
+            # Map epochs→iters with ceil for consistency
+            max_iters = math.ceil(max_epochs * iterations_per_epoch)
             print(f"training for {max_epochs} epochs = {max_iters:,} iterations")
         else:
             # Show how many epochs the current max_iters represents
-            print(f"with max_iters={max_iters}, training for {max_iters / iterations_per_epoch:.2f} epochs")
+            if max_iters is not None:
+                current_epochs = max_iters / iterations_per_epoch
+                print(f"with max_iters={max_iters}, training for {current_epochs:.2f} epochs")
     else:
         iterations_per_epoch = None
         print(f"dataset not found at {data_dir}, cannot calculate epoch information")
@@ -433,6 +434,22 @@ try:
 except Exception as e:
     iterations_per_epoch = None
     print(f"could not calculate epoch information: {e}")
+
+# Parse eval_interval strings ending with 'e' (e.g., "0.5e" for every half epoch)
+if isinstance(eval_interval, str) and eval_interval.endswith('e'):
+    if iterations_per_epoch is None:
+        print(f"ERROR: eval_interval='{eval_interval}' requires dataset to calculate epochs")
+        eval_interval = 200  # fallback to default
+    else:
+        # Extract the numeric part and convert to iterations
+        epoch_fraction = float(eval_interval[:-1])  # Remove 'e' suffix
+        eval_interval_iters = math.ceil(epoch_fraction * iterations_per_epoch)
+        print(f"eval_interval '{eval_interval}' = {eval_interval_iters} iterations ({epoch_fraction} epochs)")
+        eval_interval = eval_interval_iters
+elif iterations_per_epoch is not None:
+    # Show eval cadence for regular integer intervals
+    eval_epochs = eval_interval / iterations_per_epoch
+    print(f"eval_interval {eval_interval} = {eval_epochs:.2f} epochs")
 
 # Safety check: ensure max_iters has a value
 if max_iters is None:
@@ -671,6 +688,15 @@ elif init_from == "resume":
     model.load_state_dict(state_dict)
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
+
+    # On resume, warn if old iters/epoch differs; keep using iter_num
+    if "iterations_per_epoch" in checkpoint and iterations_per_epoch is not None:
+        old_iters_per_epoch = checkpoint["iterations_per_epoch"]
+        if old_iters_per_epoch != iterations_per_epoch:
+            print(f"WARNING: Checkpoint was saved with {old_iters_per_epoch} iters/epoch, "
+                  f"but current calculation gives {iterations_per_epoch} iters/epoch. "
+                  f"Using iter_num={iter_num} to maintain training progress.")
+
     # Restore epoch if present in checkpoint (backward compatibility)
     if "current_epoch" in checkpoint:
         current_epoch = checkpoint["current_epoch"]
@@ -1095,6 +1121,12 @@ with profiler:
 
         # termination conditions
         if max_iters is not None and iter_num > max_iters:
+            break
+        # Also check max_epochs if specified
+        if ('max_epochs' in globals() and max_epochs is not None and
+            iterations_per_epoch is not None and
+            current_epoch >= max_epochs):
+            print(f"Reached max_epochs ({max_epochs}), stopping training")
             break
 
 if ddp:
