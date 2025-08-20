@@ -28,7 +28,7 @@ except ImportError:
     MODAL_AVAILABLE = False
 
 def evaluate_critic_local(
-    checkpoint_path="out/ckpt_wandb_logging_fix.pt",
+    checkpoint_path="out/ckpt_big_critic_300.pt",
     data_dir="data/openwebtext",
     batch_size=12,
     block_size=1024,
@@ -200,7 +200,7 @@ if MODAL_AVAILABLE:
         },
     )
     def evaluate_critic_modal(
-        checkpoint_path: str = "out/ckpt_wandb_logging_fix.pt",
+        checkpoint_path: str = "out/ckpt_big_critic_300.pt",
         data_dir: str = "data/openwebtext",
         batch_size: int = 12,
         block_size: int = 1024,
@@ -348,7 +348,7 @@ if MODAL_AVAILABLE:
     
     @app.local_entrypoint()
     def modal_main(
-        checkpoint_path: str = "out/ckpt_wandb_logging_fix.pt",
+        checkpoint_path: str = "out/ckpt_big_critic_300.pt",
         data_dir: str = "data/openwebtext", 
         batch_size: int = 12,
         block_size: int = 1024,
@@ -370,7 +370,7 @@ if MODAL_AVAILABLE:
 # Local execution entrypoint
 if __name__ == "__main__" and not (MODAL_AVAILABLE and "modal" in sys.argv[0]):
     parser = argparse.ArgumentParser(description="Evaluate a critic model")
-    parser.add_argument("--checkpoint_path", type=str, default="out/ckpt_wandb_logging_fix.pt",
+    parser.add_argument("--checkpoint_path", type=str, default="out/ckpt_big_critic_300.pt",
                         help="Path to checkpoint file")
     parser.add_argument("--data_dir", type=str, default="data/openwebtext",
                         help="Directory containing validation data")

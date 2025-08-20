@@ -24,7 +24,7 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # Configuration - can be overridden from command line or config file
 # -----------------------------------------------------------------------------
-checkpoint_path = "out/ckpt_wandb_logging_fix.pt"  # Path to critic checkpoint
+checkpoint_path = "out/ckpt_big_critic_300.pt"  # Path to critic checkpoint
 data_dir = "data/openwebtext"  # Dataset directory
 batch_size = 12  # Batch size for evaluation
 block_size = 1024  # Context length
