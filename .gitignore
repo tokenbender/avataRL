@@ -207,3 +207,10 @@ out-avatarl/
 data/
 scripts/
 wandb/
+
+# IDE and editor files
+.code/
+
+# Documentation and issues (keep locally but not in remote)
+docs/
+issues/
