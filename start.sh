@@ -36,8 +36,19 @@ python3 -c "import torch; print(f'PyTorch {torch.__version__} installed')" || {
         datasets==3.6.0 \
         tiktoken==0.9.0 \
         wandb==0.19.11 \
-        tqdm==4.67.1
+        tqdm==4.67.1 \
+        numpy==2.3.2
 }
+
+# Ensure numpy is available in virtual environment if using one
+if [ -d ".venv" ]; then
+    echo "Virtual environment detected, ensuring numpy is installed..."
+    source .venv/bin/activate
+    python -c "import numpy; print(f'NumPy {numpy.__version__} available')" || {
+        echo "Installing numpy in virtual environment..."
+        python -m pip install numpy==2.3.2
+    }
+fi
 
 # Check for data
 DATA_DIR="data/openwebtext"
