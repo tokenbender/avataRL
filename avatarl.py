@@ -407,15 +407,25 @@ def get_dataset_size(split):
 try:
     if os.path.exists(os.path.join(data_dir, "train.bin")):
         train_tokens = get_dataset_size("train")
-        # Number of sequences we can sample from the dataset
-        num_sequences = train_tokens - block_size + 1
-        # Iterations per epoch = sequences / (batch_size * gradient_accumulation_steps * world_size)
-        iterations_per_epoch = num_sequences // (batch_size * gradient_accumulation_steps * ddp_world_size)
+        iterations_per_epoch = max(1, math.ceil(train_tokens / tokens_per_iter))
         tokens_per_epoch = iterations_per_epoch * tokens_per_iter
         
         print(f"dataset has {train_tokens:,} tokens")
         print(f"iterations per epoch: {iterations_per_epoch:,}")
         print(f"tokens per epoch: {tokens_per_epoch:,}")
+        
+        # Parse eval_interval if it's a string ending with 'e'
+        eval_interval_resolved = eval_interval
+        if isinstance(eval_interval, str) and eval_interval.endswith('e'):
+            try:
+                epoch_fraction = float(eval_interval[:-1])
+                eval_interval_resolved = max(1, int(math.ceil(epoch_fraction * iterations_per_epoch)))
+                print(f"eval_interval '{eval_interval}' resolved to {eval_interval_resolved} iterations ({epoch_fraction} epochs)")
+            except ValueError:
+                print(f"WARNING: Invalid eval_interval format '{eval_interval}', using default")
+                eval_interval_resolved = 200
+        else:
+            print(f"eval_interval: {eval_interval_resolved} iterations")
         
         # Handle max_epochs vs max_iters configuration
         if 'max_epochs' in globals() and max_epochs is not None:
@@ -427,12 +437,22 @@ try:
             print(f"with max_iters={max_iters}, training for {max_iters / iterations_per_epoch:.2f} epochs")
     else:
         iterations_per_epoch = None
+        eval_interval_resolved = eval_interval
+        if isinstance(eval_interval, str) and eval_interval.endswith('e'):
+            print(f"WARNING: eval_interval '{eval_interval}' requires dataset for epoch calculation, using default 200")
+            eval_interval_resolved = 200
         print(f"dataset not found at {data_dir}, cannot calculate epoch information")
+        print(f"eval_interval: {eval_interval_resolved} iterations")
         if 'max_epochs' in globals() and max_epochs is not None:
             print(f"WARNING: max_epochs specified but cannot calculate iterations without dataset")
 except Exception as e:
     iterations_per_epoch = None
+    eval_interval_resolved = eval_interval
+    if isinstance(eval_interval, str) and eval_interval.endswith('e'):
+        print(f"WARNING: eval_interval '{eval_interval}' requires dataset for epoch calculation, using default 200")
+        eval_interval_resolved = 200
     print(f"could not calculate epoch information: {e}")
+    print(f"eval_interval: {eval_interval_resolved} iterations")
 
 # Safety check: ensure max_iters has a value
 if max_iters is None:
@@ -676,6 +696,14 @@ elif init_from == "resume":
         current_epoch = checkpoint["current_epoch"]
     else:
         current_epoch = 0
+
+    # warning if iterations_per_epoch changed
+    if "iterations_per_epoch" in checkpoint and iterations_per_epoch is not None:
+        old_iterations_per_epoch = checkpoint["iterations_per_epoch"]
+        if old_iterations_per_epoch != iterations_per_epoch:
+            print(f"WARNING: iterations_per_epoch changed from {old_iterations_per_epoch} to {iterations_per_epoch}")
+            print(f"This may be due to changes in dataset, batch_size, or gradient_accumulation_steps")
+            print(f"Continuing with iter_num={iter_num} and new epoch calculation")
 elif init_from.startswith("gpt2"):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -918,7 +946,7 @@ with profiler:
                 group["momentum"] = (1 - frac) * muon_warmup_start_momentum + frac * muon_warmup_end_momentum
 
         # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % eval_interval == 0 and iter_num > 0 and master_process:
+        if iter_num % eval_interval_resolved == 0 and iter_num > 0 and master_process:
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - training_time_t0)
@@ -970,6 +998,7 @@ with profiler:
                         "use_dual_optimizer": use_dual_optimizer,  # Save optimizer type for loading
                         "current_epoch": current_epoch,  # Save epoch information
                         "iterations_per_epoch": iterations_per_epoch,  # Save for consistency checks
+                        "eval_interval_resolved": eval_interval_resolved,  # Save resolved eval interval
                     }
                     # Construct checkpoint filename with experiment name suffix
                     checkpoint_filename = "ckpt.pt" if not experiment_name else f"ckpt_{experiment_name}.pt"
