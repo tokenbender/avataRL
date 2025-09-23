@@ -31,16 +31,10 @@ import torch.distributed as dist
 from model import GPTConfig, GPT
 
 # Whether to do a https://github.dev/KellerJordan/modded-nanogpt style speedrun test.
-speedrun = os.environ.get("NANOGPT_SPEEDRUN", "false").lower() in ("true", "1")
-# Whether we're benchmarking - this calculates MFU on each iteration.
-bench = os.environ.get("NANOGPT_BENCH", "false").lower() in ("true", "1")
 speedrun_target_eval_loss = 3.28
-# Whether to profile the model. Profiling is already setup in bench.py but that doesn't
-# work with DDP, we this train.py script also profiles.
-profile: bool = os.environ.get("NANOGPT_PROFILE", "false").lower() in ("true", "1")
 
 DEFAULT_CONFIG_PATH = os.environ.get(
-    "TRAIN_DEFAULT_CONFIG", "config/train_regular_pretrain.py"
+    "TRAIN_DEFAULT_CONFIG", "config/train_avatarl.py"
 )
 if not os.path.exists(DEFAULT_CONFIG_PATH):
     raise FileNotFoundError(
@@ -51,6 +45,14 @@ if not os.path.exists(DEFAULT_CONFIG_PATH):
 print(f"Loading default config from {DEFAULT_CONFIG_PATH}")
 with open(DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as _default_cfg_file:
     exec(_default_cfg_file.read(), globals())
+
+# Environment toggles override config defaults
+speedrun = os.environ.get("NANOGPT_SPEEDRUN", "false").lower() in ("true", "1")
+# Whether we're benchmarking - this calculates MFU on each iteration.
+bench = os.environ.get("NANOGPT_BENCH", "false").lower() in ("true", "1")
+# Whether to profile the model. Profiling is already setup in bench.py but that doesn't
+# work with DDP, we this train.py script also profiles.
+profile: bool = os.environ.get("NANOGPT_PROFILE", "false").lower() in ("true", "1")
 
 if speedrun:
     eval_interval = 125
