@@ -35,69 +35,26 @@ speedrun = os.environ.get("NANOGPT_SPEEDRUN", "false").lower() in ("true", "1")
 # Whether we're benchmarking - this calculates MFU on each iteration.
 bench = os.environ.get("NANOGPT_BENCH", "false").lower() in ("true", "1")
 speedrun_target_eval_loss = 3.28
-# -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
-out_dir = "out"
-experiment_name = "regular_pretrain_250M_adamw_big_critic"  # optional experiment name suffix for checkpoint files
-# every how many steps to evaluate val loss? 0 for only at the end
-eval_interval = 500 if not speedrun else 125  # 125 is used in modded-nanogpt
-log_interval = 10
-eval_iters = 200
-eval_only = False  # if True, script exits right after the first eval
-always_save_checkpoint = True  # if True, always save a checkpoint after each eval
-init_from = "scratch"  # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
-wandb_log = True  # disabled by default
-wandb_project = "nanogpt-avatarl"
-wandb_run_name = "run_" + str(time.time())  # 'run' + str(time.time())
-# data
-dataset = "shakespeare"
-gradient_accumulation_steps = 8  # used to simulate larger batch sizes
-batch_size = 64  # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
-# model
-n_layer = 16
-n_head = 16
-n_embd = 1024
-dropout = 0.0  # for pretraining 0 is good, for finetuning try 0.1+
-bias = False  # do we use bias inside LayerNorm and Linear layers?
-# adamw optimizer
-learning_rate = 6e-4  # max learning rate (10x for better Muon dual optimizer alignment)
-# Training duration - can specify either max_iters OR max_epochs (not both)
-# If max_epochs is set, max_iters will be calculated automatically based on dataset size
-max_iters = None  # Maximum training iterations (set to None to use max_epochs instead)
-max_epochs = 1  # Maximum training epochs (set to None to use max_iters instead)
-max_tokens = None  # 50_000_000_000 to drive by tokens instead of epochs/iterations
-weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.95
-grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
-# dual optimizer settings
-use_dual_optimizer = False  # whether to use dual optimizer (Muon + Adam) like modded-nanogpt
-muon_lr = 0.05  # learning rate for Muon optimizer (hidden matrices)
-muon_momentum = 0.95  # momentum for Muon optimizer
-muon_ns_steps = 5  # Newton-Schulz iteration steps
-adam_head_lr_mult = 36  # multiplier for head layer learning rate (lr * 36)
-adam_embed_lr_mult = 100  # multiplier for embedding layer learning rate (lr * 100)
-adam_scalar_lr = 0.04  # learning rate for scalar parameters
-# learning rate decay settings
-decay_lr = True  # whether to decay the learning rate
-warmup_iters = 200  # how many steps to warm up for
-lr_decay_iters = 100000  # should be ~= max_iters per Chinchilla
-min_lr = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# DDP settings
-backend = "nccl"  # 'nccl', 'gloo', etc.
-# system
-device = (
-    "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-)
-dtype = "bfloat16"  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True  # use PyTorch 2.0 to compile the model to be faster
 # Whether to profile the model. Profiling is already setup in bench.py but that doesn't
 # work with DDP, we this train.py script also profiles.
 profile: bool = os.environ.get("NANOGPT_PROFILE", "false").lower() in ("true", "1")
-# -----------------------------------------------------------------------------
+
+DEFAULT_CONFIG_PATH = os.environ.get(
+    "TRAIN_DEFAULT_CONFIG", "config/train_regular_pretrain.py"
+)
+if not os.path.exists(DEFAULT_CONFIG_PATH):
+    raise FileNotFoundError(
+        f"Default config file not found: {DEFAULT_CONFIG_PATH}."
+        " Set TRAIN_DEFAULT_CONFIG to point to a valid config file."
+    )
+
+print(f"Loading default config from {DEFAULT_CONFIG_PATH}")
+with open(DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as _default_cfg_file:
+    exec(_default_cfg_file.read(), globals())
+
+if speedrun:
+    eval_interval = 125
+
 config_keys = [
     k
     for k, v in globals().items()
