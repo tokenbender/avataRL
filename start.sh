@@ -93,13 +93,23 @@ if [ "$SCRIPT" = "avatarl" ]; then
     echo "=== Checking Critic Model ==="
     
     # Extract critic model path from config
-    CRITIC_PATH=$(python3 -c "
-import sys
-sys.path.insert(0, 'config')
-from train_avatarl import critic_model_path
-print(critic_model_path)
-" 2>&1) || {
-        echo "ERROR: Failed to read critic_model_path from config/train_avatarl.py"
+    DEFAULT_CFG=${TRAIN_DEFAULT_CONFIG:-experiments/pretrain/avatarl/config.py}
+    CRITIC_PATH=$(DEFAULT_CFG="$DEFAULT_CFG" python3 - <<'PY'
+import os
+import runpy
+from pathlib import Path
+
+cfg_path = os.environ.get("DEFAULT_CFG")
+if not cfg_path:
+    raise RuntimeError("DEFAULT_CFG environment variable not set")
+path = Path(cfg_path)
+if not path.exists():
+    raise FileNotFoundError(f"Config file not found: {path}")
+config = runpy.run_path(str(path))
+print(config["critic_model_path"])
+PY
+    2>&1) || {
+        echo "ERROR: Failed to read critic_model_path from ${DEFAULT_CFG}"
         echo "Error details: $CRITIC_PATH"
         exit 1
     }

@@ -5,10 +5,8 @@ This directory organizes GPT pretraining variants so both `train.py` and
 
 ## Layout
 
-- `regular/` – Wrapper around `config/train_regular_pretrain.py` (vanilla
-  GPT pretrain setup).
-- `avatarl/` – Wrapper around `config/train_avatarl.py` (dual critic
-  pretrain used by AvataRL).
+- `regular/` – Vanilla GPT pretrain setup (mirrors the original train.py defaults).
+- `avatarl/` – AvataRL dual-expert pretrain configuration.
 - `baseline_small/` – Lightweight variant for smoke tests (fewer layers,
   smaller batch, lower LR).
 

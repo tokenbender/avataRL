@@ -20,6 +20,8 @@ import os
 import time
 import math
 from contextlib import nullcontext
+from pathlib import Path
+import runpy
 
 import numpy as np
 import torch
@@ -30,8 +32,23 @@ import torch.distributed as dist
 
 from model import GPTConfig, GPT
 
-# Import all configuration variables
-from config.train_avatarl import *
+DEFAULT_CONFIG_PATH = os.environ.get(
+    "AVATARL_DEFAULT_CONFIG", "experiments/pretrain/avatarl/config.py"
+)
+if not os.path.exists(DEFAULT_CONFIG_PATH):
+    raise FileNotFoundError(
+        f"Default config file not found: {DEFAULT_CONFIG_PATH}."
+        " Set AVATARL_DEFAULT_CONFIG to point to a valid config file."
+    )
+
+print(f"Loading default config from {DEFAULT_CONFIG_PATH}")
+config_values = runpy.run_path(DEFAULT_CONFIG_PATH)
+globals().update(config_values)
+
+# Environment toggles override config defaults
+speedrun = os.environ.get("NANOGPT_SPEEDRUN", "false").lower() in ("true", "1")
+bench = os.environ.get("NANOGPT_BENCH", "false").lower() in ("true", "1")
+profile = os.environ.get("NANOGPT_PROFILE", "false").lower() in ("true", "1")
 
 # -----------------------------------------------------------------------------
 # Create config dictionary for logging

@@ -34,7 +34,7 @@ from model import GPTConfig, GPT
 speedrun_target_eval_loss = 3.28
 
 DEFAULT_CONFIG_PATH = os.environ.get(
-    "TRAIN_DEFAULT_CONFIG", "config/train_avatarl.py"
+    "TRAIN_DEFAULT_CONFIG", "experiments/pretrain/avatarl/config.py"
 )
 if not os.path.exists(DEFAULT_CONFIG_PATH):
     raise FileNotFoundError(
