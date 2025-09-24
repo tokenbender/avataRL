@@ -21,6 +21,9 @@ python train.py experiments/pretrain/regular_300m/config.py
 python avatarl.py experiments/pretrain/avatarl_70m/config.py
 ```
 
+Checkpoints now land beside each config under an `out/` folder
+(e.g. `experiments/pretrain/regular_30m/out/`).
+
 Override individual hyperparameters on the CLI as usual:
 
 ```bash

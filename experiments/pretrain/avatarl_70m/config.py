@@ -1,10 +1,11 @@
 """AvataRL pretraining config targeting ~70M parameters."""
 
 import time
+from pathlib import Path
 
 # -----------------------------------------------------------------------------
 # I/O
-out_dir = "out"
+out_dir = str(Path(__file__).resolve().parent / "out")
 experiment_name = "avatarl_pretrain_70M"
 
 # Evaluation cadence

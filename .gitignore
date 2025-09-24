@@ -205,8 +205,12 @@ openwebtext/
 out/
 out-avatarl/
 data/
-scripts/
+scripts/*
+!scripts/
+!scripts/run_size_sweep.sh
+!scripts/run_size_sweep.sh
 wandb/
+experiments/pretrain/*/out/
 
 # IDE and editor files
 .code/

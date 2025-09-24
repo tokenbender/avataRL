@@ -1,10 +1,11 @@
 """AvataRL GPT pretraining hyperparameters."""
 
 import time
+from pathlib import Path
 
 # -----------------------------------------------------------------------------
 # I/O
-out_dir = "out"  # Changed to be inside /root/out Modal volume mount
+out_dir = str(Path(__file__).resolve().parent / "out")
 experiment_name = "avatarl_pretrain_250M_adamw_big_critic"
 
 # Evaluation and logging intervals

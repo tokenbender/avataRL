@@ -111,7 +111,7 @@ modal run modal_train.py:train_avatarl_single_node
 
 ## sampling from trained models
 
-sample.py looks for checkpoints in the `out/` directory by default. The checkpoint filename is constructed as `ckpt_{experiment_name}.pt`.
+sample.py looks for checkpoints in the `out/` directory relative to the config (for example `experiments/pretrain/avatarl/out/`). The checkpoint filename is constructed as `ckpt_{experiment_name}.pt`.
 
 ```bash
 # generate text from a trained checkpoint (looks in out/ckpt_avatarl_pretrain_250M_adamw_big_critic.pt)

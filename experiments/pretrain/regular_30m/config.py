@@ -1,9 +1,10 @@
 """Regular GPT pretraining config targeting ~30M parameters."""
 
 import time
+from pathlib import Path
 
 # I/O
-out_dir = "out"
+out_dir = str(Path(__file__).resolve().parent / "out")
 experiment_name = "regular_pretrain_30M"
 
 # Evaluation cadence
