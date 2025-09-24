@@ -17,7 +17,7 @@ init_from = "scratch"
 
 # wandb logging
 wandb_log = True
-wandb_project = "nanogpt-avatarl"
+wandb_project = "avatarl_ablations_with_standard_pretraining"
 wandb_run_name = "regular_70M_" + str(time.time())
 
 # data

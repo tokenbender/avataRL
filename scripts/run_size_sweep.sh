@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Common Weights & Biases metadata
-export WANDB_PROJECT="${WANDB_PROJECT:-nanogpt-avatarl}"
+export WANDB_PROJECT="${WANDB_PROJECT:-avatarl_ablations_with_standard_pretraining}"
 export EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-pretrain_size_sweep}"
 
 # Torchrun launch arguments (override via REGULAR_TORCHRUN_ARGS / AVATARL_TORCHRUN_ARGS)
