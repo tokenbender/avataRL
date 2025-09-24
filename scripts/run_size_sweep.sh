@@ -13,9 +13,25 @@ log() {
   printf '\n[%-24s] %s\n' "${1}" "${2}"
 }
 
+set_run_metadata() {
+  local cfg="$1"
+  local sha diff
+  sha=$(git rev-parse HEAD)
+  diff=$(git diff --stat HEAD || true)
+  if [[ -z "${diff}" ]]; then
+    diff="clean working tree"
+  fi
+  export GIT_SHA="${sha}"
+  export GIT_DIFF="${diff}"
+  export WANDB_TAGS="sweep,${cfg}"
+  printf -v WANDB_NOTES 'commit:%s\n%s' "${sha}" "${diff}"
+  export WANDB_NOTES
+}
+
 run_regular() {
   local cfg="$1"
   local path="experiments/pretrain/${cfg}/config.py"
+  set_run_metadata "${cfg}"
   read -r -a args <<< "${REGULAR_TORCHRUN_ARGS}"
   log "regular" "Starting ${cfg}"
   EXPERIMENT_NAME="${cfg}" torchrun "${args[@]}" train.py "${path}"
@@ -24,6 +40,7 @@ run_regular() {
 run_avatarl() {
   local cfg="$1"
   local path="experiments/pretrain/${cfg}/config.py"
+  set_run_metadata "${cfg}"
   read -r -a args <<< "${AVATARL_TORCHRUN_ARGS}"
   log "avatarl" "Starting ${cfg}"
   EXPERIMENT_NAME="${cfg}" torchrun "${args[@]}" avatarl.py "${path}"
