@@ -805,19 +805,19 @@ def estimate_loss():
     out = {}
     model.eval()
     critic_model.eval()  # Ensure critic is in eval mode too
-    
+
     for split in ["train", "val"]:
         losses = torch.zeros(eval_iters)
         ce_losses = torch.zeros(eval_iters)
-        
+
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
                 student_logits, _ = model(X, Y)
-                
+
                 with torch.no_grad():
                     critic_logits, _ = critic_model(X, Y)
-                
+
                 loss, _ = compute_avatarl_loss(
                     student_logits, critic_logits, Y,
                     reality_weight=reality_weight,
@@ -826,19 +826,19 @@ def estimate_loss():
                     reward_scale=reward_scale,
                     top_k=top_k,
                     entropy_coefficient=entropy_coefficient,
-                    max_reward_clamp=max_reward_clamp
+                    max_reward_clamp=max_reward_clamp,
                 )
                 losses[k] = loss.item()
 
                 ce_loss = torch.nn.functional.cross_entropy(
                     student_logits.view(-1, student_logits.size(-1)),
-                    Y.view(-1)
+                    Y.view(-1),
                 )
                 ce_losses[k] = ce_loss.item()
-        
-        out[split] = losses.mean()
-        out[f"{split}_ce"] = ce_losses.mean()
-    
+
+        out[f"{split}_av_loss"] = losses.mean()
+        out[f"{split}_ce_loss"] = ce_losses.mean()
+
     model.train()
     critic_model.eval()
     return out
@@ -947,9 +947,9 @@ with profiler:
             losses = estimate_loss()
             epoch_str = f" (epoch {current_epoch:.2f})" if iterations_per_epoch else ""
             print(
-                f"step {iter_num}{epoch_str}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, val_ce_loss {losses['val_ce']:.4f} train_time:{training_time_ms:.0f}ms"
+                f"step {iter_num}{epoch_str}: train av_loss {losses['train_av_loss']:.4f}, val av_loss {losses['val_av_loss']:.4f}, val ce_loss {losses['val_ce_loss']:.4f} train_time:{training_time_ms:.0f}ms"
             )
-            if speedrun and losses["val"] < speedrun_target_eval_loss:
+            if speedrun and losses["val_av_loss"] < speedrun_target_eval_loss:
                 print(
                     f"Speedrun target eval loss {speedrun_target_eval_loss} reached! 🏆"
                 )
@@ -961,9 +961,10 @@ with profiler:
             if wandb_log:
                 log_dict = {
                     "iter": iter_num,
-                    "train/loss": losses["train"],
-                    "val/loss": losses["val"],
-                    "val/ce_loss": losses["val_ce"],
+                    "train/av_loss": losses["train_av_loss"],
+                    "val/av_loss": losses["val_av_loss"],
+                    "train/ce_loss": losses["train_ce_loss"],
+                    "val/ce_loss": losses["val_ce_loss"],
                     "lr": lr,
                     "mfu": running_mfu * 100,  # convert to percentage
                 }
@@ -977,9 +978,9 @@ with profiler:
                     })
                 wandb.log(log_dict)
             if (
-                losses["val"] < best_val_loss or always_save_checkpoint
+                losses["val_av_loss"] < best_val_loss or always_save_checkpoint
             ) and not speedrun:
-                best_val_loss = losses["val"]
+                best_val_loss = losses["val_av_loss"]
                 if iter_num > 0:
                     checkpoint = {
                         "model": raw_model.state_dict(),
