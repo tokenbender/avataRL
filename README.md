@@ -21,7 +21,7 @@ and we might be creating lots of unorthodox things here, as any fun loving perso
 - `avatarl.py` - main training script implementing avatarl reinforcement learning algorithm for language model pretraining
 - `train.py` - standard pretraining script for creating baseline models for ablation studies
 - `model.py` - gpt model architecture with transformer blocks, attention, and language modeling head
-- `experiments/pretrain/avatarl/config.py` - training configuration for AvataRL experiments (hyperparameters, model size, optimizer settings)
+- `experiments/pretrain/avatarl/config.py` - default AvataRL config (see `experiments/pretrain/avatarl_*` and `experiments/pretrain/regular_*` for size variants)
 - `configurator.py` - command-line configuration override system for experiment management
 - `modal_train.py` - modal cloud deployment for distributed training, profiling and ~~benchmaxxing~~ benchmarking.
 - `start.sh` - local training launcher to run experiments with environment setup and multi-gpu support
@@ -44,7 +44,23 @@ avatarl/
     └── pretrain/
         ├── avatarl/
         │   └── config.py
+        ├── avatarl_30m/
+        │   └── config.py
+        ├── avatarl_70m/
+        │   └── config.py
+        ├── avatarl_150m/
+        │   └── config.py
+        ├── avatarl_300m/
+        │   └── config.py
         ├── regular/
+        │   └── config.py
+        ├── regular_30m/
+        │   └── config.py
+        ├── regular_70m/
+        │   └── config.py
+        ├── regular_150m/
+        │   └── config.py
+        ├── regular_300m/
         │   └── config.py
         └── baseline_small/
             └── config.py
@@ -80,7 +96,7 @@ python avatarl.py --compile=False
 torchrun --nproc_per_node=8 avatarl.py
 ```
 
-edit `experiments/pretrain/avatarl/config.py` (or another config variant) to change hyperparameters before running.
+edit `experiments/pretrain/avatarl/config.py` or pick one of the size-sweep configs (for example `experiments/pretrain/avatarl_150m/config.py`) to change hyperparameters before running.
 
 ### modal cloud training
 

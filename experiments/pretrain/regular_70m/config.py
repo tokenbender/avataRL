@@ -1,0 +1,66 @@
+"""Regular GPT pretraining config targeting ~70M parameters."""
+
+import time
+
+# I/O
+out_dir = "out"
+experiment_name = "regular_pretrain_70M"
+
+# Evaluation cadence
+eval_interval = 400
+log_interval = 10
+eval_iters = 200
+eval_only = False
+always_save_checkpoint = True
+init_from = "scratch"
+
+# wandb logging
+wandb_log = True
+wandb_project = "nanogpt-avatarl"
+wandb_run_name = "regular_70M_" + str(time.time())
+
+# data
+dataset = "shakespeare"
+gradient_accumulation_steps = 8
+batch_size = 48
+block_size = 1024
+
+# model (≈70M params)
+n_layer = 14
+n_head = 8
+n_embd = 512
+dropout = 0.0
+bias = False
+
+# optimizer
+learning_rate = 5e-4
+max_iters = None
+max_epochs = 1
+max_tokens = None
+weight_decay = 1e-1
+beta1 = 0.9
+beta2 = 0.95
+grad_clip = 1.0
+
+# dual optimizer settings
+use_dual_optimizer = False
+muon_lr = 0.05
+muon_momentum = 0.95
+muon_ns_steps = 5
+adam_head_lr_mult = 36
+adam_embed_lr_mult = 100
+adam_scalar_lr = 0.04
+
+# learning rate decay
+decay_lr = True
+warmup_iters = 150
+lr_decay_iters = 80000
+min_lr = 5e-5
+
+# DDP
+backend = "nccl"
+
+# system
+device = "cuda"
+dtype = "bfloat16"
+compile = True
