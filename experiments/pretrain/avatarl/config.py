@@ -19,7 +19,7 @@ init_from = "scratch"
 
 # wandb logging
 wandb_log = True
-wandb_project = "avatarl_ablations_with_standard_pretraining"
+wandb_project = "test_sweep"
 wandb_run_name = "run_" + str(time.time())
 
 # data
@@ -41,8 +41,9 @@ learning_rate = 6e-4  # Adjusted for better stability with AvataRL
 
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
-max_iters = None  # Maximum training iterations (set to None to use max_epochs instead)
-max_epochs = 3000  # Maximum training epochs (set to None to use max_iters instead)
+max_iters = None
+max_epochs = None
+max_tokens = 90_000_000
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -59,7 +60,7 @@ adam_scalar_lr = 0.04  # learning rate for scalar parameters
 # learning rate decay
 decay_lr = True
 warmup_iters = 200  # Increased to match teacher model
-lr_decay_iters = 100000  # Same as max_iters for full decay
+lr_decay_iters = 100000  # Iterations over which to decay the LR schedule
 min_lr = 6e-5  # ~1/10 of learning_rate per Chinchilla
 
 # DDP settings

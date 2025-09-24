@@ -17,11 +17,11 @@ init_from = "scratch"
 
 # wandb logging
 wandb_log = True
-wandb_project = "avatarl_ablations_with_standard_pretraining"
+wandb_project = "test_sweep"
 wandb_run_name = "regular_70M_" + str(time.time())
 
 # data
-dataset = "shakespeare"
+dataset = "openwebtext"
 gradient_accumulation_steps = 8
 batch_size = 48
 block_size = 1024
@@ -36,8 +36,8 @@ bias = False
 # optimizer
 learning_rate = 5e-4
 max_iters = None
-max_epochs = 1
-max_tokens = None
+max_epochs = None
+max_tokens = 90_000_000
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
