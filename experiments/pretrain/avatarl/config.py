@@ -41,14 +41,14 @@ learning_rate = 6e-4  # Adjusted for better stability with AvataRL
 
 # Training duration - can specify either max_iters OR max_epochs (not both)
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
-max_iters = 201  # Maximum training iterations (set to None to use max_epochs instead)
-max_epochs = None  # Maximum training epochs (set to None to use max_iters instead)
+max_iters = None  # Maximum training iterations (set to None to use max_epochs instead)
+max_epochs = 3000  # Maximum training epochs (set to None to use max_iters instead)
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0
 # dual optimizer settings
-use_dual_optimizer = False  # Enable dual optimizer (Muon + Adam) matching teacher config
+use_dual_optimizer = True  # Enable dual optimizer (Muon + Adam) matching teacher config
 muon_lr = 0.05  # learning rate for Muon optimizer (hidden matrices)
 muon_momentum = 0.95  # momentum for Muon optimizer
 muon_ns_steps = 5  # Newton-Schulz iteration steps
