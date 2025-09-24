@@ -48,7 +48,7 @@ beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0
 # dual optimizer settings
-use_dual_optimizer = True  # Enable dual optimizer (Muon + Adam) matching teacher config
+use_dual_optimizer = False  # Enable dual optimizer (Muon + Adam) matching teacher config
 muon_lr = 0.05  # learning rate for Muon optimizer (hidden matrices)
 muon_momentum = 0.95  # momentum for Muon optimizer
 muon_ns_steps = 5  # Newton-Schulz iteration steps
