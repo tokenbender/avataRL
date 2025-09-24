@@ -20,6 +20,7 @@ init_from = "scratch"
 wandb_log = True
 wandb_project = "test_sweep"
 wandb_run_name = "avatarl_300M_" + str(time.time())
+wandb_dir = str(Path(__file__).resolve().parent)
 
 # data
 dataset = "openwebtext"

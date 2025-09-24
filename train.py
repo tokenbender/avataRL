@@ -542,7 +542,11 @@ def get_lr(it):
 if wandb_log and master_process:
     import wandb
 
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb_kwargs = dict(project=wandb_project, name=wandb_run_name, config=config)
+    wandb_dir_from_config = config.get("wandb_dir")
+    if wandb_dir_from_config:
+        wandb_kwargs["dir"] = wandb_dir_from_config
+    wandb.init(**wandb_kwargs)
 
 wait, warmup, active, repeat = 5, 5, 5, 2
 num_steps = wait + warmup + active
