@@ -633,7 +633,7 @@ with profiler:
             )
             if speedrun and losses["val_ce_loss"] < speedrun_target_eval_loss:
                 print(
-                    f"Speedrun target eval loss {speedrun_target_eval_loss} reached! 🏆"
+                    f"Speedrun target eval ce_loss {speedrun_target_eval_loss} reached! 🏆"
                 )
                 # we must teardown or else the program will hang waiting for other processes
                 if ddp:
@@ -645,8 +645,6 @@ with profiler:
                     "iter": iter_num,
                     "train/ce_loss": losses["train_ce_loss"],
                     "val/ce_loss": losses["val_ce_loss"],
-                    "train/av_loss": losses["train_ce_loss"],
-                    "val/av_loss": losses["val_ce_loss"],
                     "lr": lr,
                     "mfu": running_mfu * 100,  # convert to percentage
                 }
@@ -726,7 +724,7 @@ with profiler:
             tokens_seen = (iter_num + 1) * tokens_per_iter  # +1 because we log before incrementing iter_num
             lossf = loss.item() * gradient_accumulation_steps
 
-            out_str = f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, tokens ~{tokens_seen:,}"
+            out_str = f"iter {iter_num}: ce_loss {lossf:.4f}, time {dt * 1000:.2f}ms, tokens ~{tokens_seen:,}"
 
             if local_iter_num >= 5:
                 mfu = raw_model.estimate_mfu(

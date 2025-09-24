@@ -951,7 +951,7 @@ with profiler:
             )
             if speedrun and losses["val_av_loss"] < speedrun_target_eval_loss:
                 print(
-                    f"Speedrun target eval loss {speedrun_target_eval_loss} reached! 🏆"
+                    f"Speedrun target eval av_loss {speedrun_target_eval_loss} reached! 🏆"
                 )
                 # we must teardown or else the program will hang waiting for other processes
                 if ddp:
@@ -1075,7 +1075,7 @@ with profiler:
             lossf = loss.item() * gradient_accumulation_steps
 
             epoch_str = f" (epoch {current_epoch:.2f})" if iterations_per_epoch else ""
-            out_str = f"iter {iter_num}{epoch_str}: loss {lossf:.4f}, ce_loss {top1_ce_loss.item():.4f}, time {dt * 1000:.2f}ms"
+            out_str = f"iter {iter_num}{epoch_str}: av_loss {lossf:.4f}, ce_loss {top1_ce_loss.item():.4f}, time {dt * 1000:.2f}ms"
             
             # Update running averages for AvataRL metrics
             if 'avatarl_metrics' in locals():
