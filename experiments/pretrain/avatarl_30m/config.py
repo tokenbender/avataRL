@@ -12,9 +12,9 @@ out_dir = str(_CONFIG_DIR / "out")
 experiment_name = "avatarl_pretrain_30M"
 
 # Evaluation cadence
-eval_interval = 200
+eval_interval = 400
 log_interval = 10
-eval_iters = 80
+eval_iters = 200
 eval_only = False
 always_save_checkpoint = True
 init_from = "scratch"
@@ -28,8 +28,8 @@ wandb_dir = str(_CONFIG_DIR)
 # data
 dataset = "openwebtext"
 gradient_accumulation_steps = 8
-batch_size = 16
-block_size = 1024
+batch_size = 128
+block_size = 1048
 
 # model (≈30M params)
 n_layer = 6
