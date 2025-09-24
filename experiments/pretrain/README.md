@@ -16,9 +16,9 @@ Each subdirectory exposes a `config.py` that can be passed directly to
 the training scripts, e.g.:
 
 ```bash
-python train.py experiments/pretrain/regular_30m/config.py
-python train.py experiments/pretrain/regular_300m/config.py
-python avatarl.py experiments/pretrain/avatarl_70m/config.py
+torchrun --standalone --nproc_per_node=1 train.py experiments/pretrain/regular_30m/config.py
+torchrun --standalone --nproc_per_node=1 train.py experiments/pretrain/regular_300m/config.py
+torchrun --standalone --nproc_per_node=1 avatarl.py experiments/pretrain/avatarl_70m/config.py
 ```
 
 Checkpoints now land beside each config under an `out/` folder
@@ -27,7 +27,7 @@ Checkpoints now land beside each config under an `out/` folder
 Override individual hyperparameters on the CLI as usual:
 
 ```bash
-python train.py experiments/pretrain/baseline_small/config.py --max_iters=500
+torchrun --standalone --nproc_per_node=1 train.py experiments/pretrain/baseline_small/config.py --max_iters=500
 ```
 
 Feel free to add more variant folders following the same pattern.

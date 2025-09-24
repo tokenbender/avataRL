@@ -2,8 +2,12 @@
 set -euo pipefail
 
 # Common Weights & Biases metadata
-export WANDB_PROJECT=${WANDB_PROJECT:-nanogpt-avatarl}
-export EXPERIMENT_GROUP=${EXPERIMENT_GROUP:-pretrain_size_sweep}
+export WANDB_PROJECT="${WANDB_PROJECT:-nanogpt-avatarl}"
+export EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-pretrain_size_sweep}"
+
+# Torchrun launch arguments (override via REGULAR_TORCHRUN_ARGS / AVATARL_TORCHRUN_ARGS)
+REGULAR_TORCHRUN_ARGS="${REGULAR_TORCHRUN_ARGS:---standalone --nproc_per_node=1}"
+AVATARL_TORCHRUN_ARGS="${AVATARL_TORCHRUN_ARGS:---standalone --nproc_per_node=1}"
 
 log() {
   printf '\n[%-24s] %s\n' "${1}" "${2}"
@@ -12,15 +16,17 @@ log() {
 run_regular() {
   local cfg="$1"
   local path="experiments/pretrain/${cfg}/config.py"
+  read -r -a args <<< "${REGULAR_TORCHRUN_ARGS}"
   log "regular" "Starting ${cfg}"
-  EXPERIMENT_NAME="${cfg}" python train.py "${path}"
+  EXPERIMENT_NAME="${cfg}" torchrun "${args[@]}" train.py "${path}"
 }
 
 run_avatarl() {
   local cfg="$1"
   local path="experiments/pretrain/${cfg}/config.py"
+  read -r -a args <<< "${AVATARL_TORCHRUN_ARGS}"
   log "avatarl" "Starting ${cfg}"
-  EXPERIMENT_NAME="${cfg}" python avatarl.py "${path}"
+  EXPERIMENT_NAME="${cfg}" torchrun "${args[@]}" avatarl.py "${path}"
 }
 
 regular_configs=(
@@ -40,13 +46,9 @@ avatarl_configs=(
 for cfg in "${regular_configs[@]}"; do
   run_regular "${cfg}"
   log "regular" "Finished ${cfg}"
-
 done
-
 for cfg in "${avatarl_configs[@]}"; do
   run_avatarl "${cfg}"
   log "avatarl" "Finished ${cfg}"
-
 done
-
 log "all done" "Ablation sweep complete"
