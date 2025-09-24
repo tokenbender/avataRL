@@ -20,6 +20,7 @@ import os
 import time
 import math
 from contextlib import nullcontext
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -43,8 +44,11 @@ if not os.path.exists(DEFAULT_CONFIG_PATH):
     )
 
 print(f"Loading default config from {DEFAULT_CONFIG_PATH}")
-with open(DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as _default_cfg_file:
+_default_config_path = Path(DEFAULT_CONFIG_PATH).resolve()
+with open(_default_config_path, "r", encoding="utf-8") as _default_cfg_file:
+    globals()["_CONFIG_PATH"] = _default_config_path
     exec(_default_cfg_file.read(), globals())
+    globals().pop("_CONFIG_PATH", None)
 
 # Environment toggles override config defaults
 speedrun = os.environ.get("NANOGPT_SPEEDRUN", "false").lower() in ("true", "1")

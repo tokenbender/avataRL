@@ -3,8 +3,11 @@
 import time
 from pathlib import Path
 
+_CONFIG_PATH = Path(globals().get("_CONFIG_PATH", Path(__file__).resolve()))
+_CONFIG_DIR = _CONFIG_PATH.parent
+
 # I/O
-out_dir = str(Path(__file__).resolve().parent / "out")
+out_dir = str(_CONFIG_DIR / "out")
 experiment_name = "baseline_small"
 
 # Evaluation cadence
@@ -19,7 +22,7 @@ init_from = "scratch"
 wandb_log = True
 wandb_project = "test_sweep"
 wandb_run_name = "run_" + str(time.time())
-wandb_dir = str(Path(__file__).resolve().parent)
+wandb_dir = str(_CONFIG_DIR)
 
 # data
 dataset = "openwebtext"

@@ -16,6 +16,7 @@ comes up with a better simple Python solution I am all ears.
 
 import sys
 from ast import literal_eval
+from pathlib import Path
 
 for arg in sys.argv[1:]:
     if "=" not in arg:
@@ -25,7 +26,9 @@ for arg in sys.argv[1:]:
         print(f"Overriding config with {config_file}:")
         with open(config_file) as f:
             print(f.read())
+        globals()["_CONFIG_PATH"] = Path(config_file).resolve()
         exec(open(config_file).read())
+        globals().pop("_CONFIG_PATH", None)
     else:
         # assume it's a --key=value argument
         assert arg.startswith("--")
