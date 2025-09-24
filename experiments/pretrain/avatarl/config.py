@@ -47,7 +47,7 @@ learning_rate = 6e-4  # Adjusted for better stability with AvataRL
 # If max_epochs is set, max_iters will be calculated automatically based on dataset size
 max_iters = None
 max_epochs = None
-max_tokens = 90_000_000
+max_tokens = 900_000_000
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
