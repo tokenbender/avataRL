@@ -74,7 +74,7 @@ bench = False
 # -----------------------------------------------------------------------------
 # AvataRL specific parameters
 # -----------------------------------------------------------------------------
-critic_model_path = "out/ckpt_critic_30M.pt"
+critic_model_path = "experiments/pretrain/regular_30m/out/ckpt_regular_pretrain_30M.pt"
 use_4bit_critic = True
 
 reality_weight = 0.7
