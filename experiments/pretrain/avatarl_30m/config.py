@@ -28,7 +28,7 @@ wandb_dir = str(_CONFIG_DIR)
 # data
 dataset = "openwebtext"
 gradient_accumulation_steps = 8
-batch_size = 128
+batch_size = 64
 block_size = 1048
 
 # model (≈30M params)
