@@ -393,6 +393,9 @@ else:
     seed_offset = 0
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+if "max_tokens" in globals() and max_tokens is not None and max_iters is None:
+    max_iters = math.ceil(max_tokens / tokens_per_iter)
+    print(f"planning for ~{max_tokens:,} tokens ⇒ {max_iters:,} updates")
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 # Define data directory for dataset
@@ -1073,9 +1076,13 @@ with profiler:
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
             lossf = loss.item() * gradient_accumulation_steps
+            tokens_seen = (iter_num + 1) * tokens_per_iter  # +1 because we log before incrementing iter_num
 
             epoch_str = f" (epoch {current_epoch:.2f})" if iterations_per_epoch else ""
-            out_str = f"iter {iter_num}{epoch_str}: av_loss {lossf:.4f}, ce_loss {top1_ce_loss.item():.4f}, time {dt * 1000:.2f}ms"
+            out_str = (
+                f"iter {iter_num}{epoch_str}: av_loss {lossf:.4f}, ce_loss {top1_ce_loss.item():.4f}, "
+                f"time {dt * 1000:.2f}ms, tokens ~{tokens_seen:,}"
+            )
             
             # Update running averages for AvataRL metrics
             if 'avatarl_metrics' in locals():
@@ -1116,7 +1123,7 @@ with profiler:
             profiler.step()
 
         # termination conditions
-        if max_iters is not None and iter_num > max_iters:
+        if max_iters is not None and iter_num >= max_iters:
             break
 
 if ddp:
