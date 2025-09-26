@@ -17,6 +17,7 @@ eval_iters = 200
 eval_only = False
 always_save_checkpoint = True
 init_from = "scratch"
+top_k = 8
 
 # wandb logging
 wandb_log = True

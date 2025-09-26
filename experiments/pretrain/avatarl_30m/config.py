@@ -81,7 +81,7 @@ reality_weight = 0.7
 mentor_weight = 0.3
 label_smoothing_epsilon = 0.1
 reward_scale = 100.0
-top_k = 4
+top_k = 8
 entropy_coefficient = 0.01
 max_reward_clamp = 1.5
 
