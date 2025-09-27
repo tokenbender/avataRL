@@ -12,9 +12,9 @@ out_dir = str(_CONFIG_DIR / "out")
 experiment_name = "avatarl_pretrain_300M"
 
 # Evaluation cadence
-eval_interval = 200
+eval_interval = 400
 log_interval = 10
-eval_iters = 80
+eval_iters = 200
 eval_only = False
 always_save_checkpoint = True
 init_from = "scratch"
@@ -29,7 +29,7 @@ wandb_dir = str(_CONFIG_DIR)
 dataset = "openwebtext"
 gradient_accumulation_steps = 8
 batch_size = 8
-block_size = 1024
+block_size = 1048
 
 # model (≈300M params)
 n_layer = 20
@@ -39,7 +39,7 @@ dropout = 0.0
 bias = False
 
 # optimizer
-learning_rate = 3e-4
+learning_rate = 6e-4
 max_iters = None
 max_epochs = None
 max_tokens = 9_000_000_000
@@ -59,9 +59,9 @@ adam_scalar_lr = 0.04
 
 # learning rate decay
 decay_lr = True
-warmup_iters = 300
-lr_decay_iters = 150000
-min_lr = 3e-5
+warmup_iters = 100
+lr_decay_iters = 60000
+min_lr = 6e-5
 
 # system
 device = "cuda"
@@ -74,14 +74,14 @@ bench = False
 # -----------------------------------------------------------------------------
 # AvataRL specific parameters
 # -----------------------------------------------------------------------------
-critic_model_path = "out/ckpt_critic_30M.pt"
+critic_model_path = "experiments/pretrain/regular_30m/out/ckpt_regular_pretrain_30M.pt"
 use_4bit_critic = True
 
 reality_weight = 0.7
 mentor_weight = 0.3
 label_smoothing_epsilon = 0.1
 reward_scale = 100.0
-top_k = 4
+top_k = 16
 entropy_coefficient = 0.01
 max_reward_clamp = 1.5
 

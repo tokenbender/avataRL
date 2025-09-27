@@ -11,7 +11,7 @@ out_dir = str(_CONFIG_DIR / "out")
 experiment_name = "regular_pretrain_300M"
 
 # Evaluation cadence
-eval_interval = 500
+eval_interval = 400
 log_interval = 10
 eval_iters = 200
 eval_only = False
@@ -28,7 +28,7 @@ wandb_dir = str(_CONFIG_DIR)
 dataset = "openwebtext"
 gradient_accumulation_steps = 8
 batch_size = 16
-block_size = 1024
+block_size = 1048
 
 # model (≈300M params)
 n_layer = 20
@@ -38,7 +38,7 @@ dropout = 0.0
 bias = False
 
 # optimizer
-learning_rate = 3e-4
+learning_rate = 6e-4
 max_iters = None
 max_epochs = None
 max_tokens = 9_000_000_000
@@ -58,9 +58,9 @@ adam_scalar_lr = 0.04
 
 # learning rate decay
 decay_lr = True
-warmup_iters = 300
-lr_decay_iters = 150000
-min_lr = 3e-5
+warmup_iters = 100
+lr_decay_iters = 60000
+min_lr = 6e-5
 
 # DDP
 backend = "nccl"
