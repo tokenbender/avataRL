@@ -75,10 +75,10 @@ bench = False
 # AvataRL specific parameters
 # -----------------------------------------------------------------------------
 critic_model_path = "experiments/pretrain/regular_30m/out/ckpt_regular_pretrain_30M.pt"
-use_4bit_critic = True
+use_4bit_critic = False
 
-reality_weight = 0.99
-mentor_weight = 0.01
+reality_weight = 0.90
+mentor_weight = 0.10
 label_smoothing_epsilon = 0.1
 reward_scale = 100.0
 top_k = 16
