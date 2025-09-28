@@ -83,7 +83,7 @@ label_smoothing_epsilon = 0.1
 reward_scale = 100.0
 top_k = 16
 entropy_coefficient = 0.01
-max_reward_clamp = 1.5
+max_reward_clamp = 3.0
 
 muon_warmup_iters = 300
 muon_warmup_start_momentum = 0.85
